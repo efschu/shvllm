@@ -169,7 +169,7 @@ RUN mkdir -p "${UV_PYTHON_INSTALL_DIR}" "${UV_CACHE_DIR}" "${UV_INSTALL_DIR}" \
     && apt-get update -y \
     && apt-get install -y --no-install-recommends python3-pip \
     && rm -rf /var/lib/apt/lists/* \
-    && pip3 install --break-system-packages uv \
+    && pip3 install --target /opt/uv/bin uv \
     # `--seed` installs pip/setuptools/wheel into the venv so `python3 -m
     # pip` works regardless of how uv happens to link the venv back to the
     # managed Python install (which, at a non-default UV_PYTHON_INSTALL_DIR,

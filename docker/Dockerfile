@@ -167,10 +167,10 @@ RUN if [ "${BUILD_OS}" = "manylinux" ]; then \
 RUN mkdir -p "${UV_PYTHON_INSTALL_DIR}" "${UV_CACHE_DIR}" "${UV_INSTALL_DIR}" \
     && chmod -R a+rX /opt/uv \
     && apt-get update -y \
-    && apt-get install -y --no-install-recommends python3-venv python3-pip \
+    && apt-get install -y --no-install-recommends python3-venv \
     && rm -rf /var/lib/apt/lists/* \
     && python3 -m venv /opt/venv \
-    && /opt/venv/bin/python3 -m pip install --upgrade pip setuptools wheel uv 2>/dev/null || true \
+    && /opt/venv/bin/python3 -m pip install uv 2>/dev/null || true \
     && rm -f /usr/bin/python3 /usr/bin/python3-config /usr/bin/pip \
     && ln -sf /opt/venv/bin/python3 /usr/bin/python3 \
     && ln -sf /opt/venv/bin/python3-config /usr/bin/python3-config \

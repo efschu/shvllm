@@ -169,9 +169,8 @@ RUN mkdir -p "${UV_PYTHON_INSTALL_DIR}" "${UV_CACHE_DIR}" "${UV_INSTALL_DIR}" \
     && apt-get update -y \
     && apt-get install -y --no-install-recommends python3-venv python3-pip \
     && rm -rf /var/lib/apt/lists/* \
-    && pip3 install --break-system-packages uv \
     && python3 -m venv /opt/venv \
-    && /opt/venv/bin/python3 -m pip install --upgrade pip setuptools wheel 2>/dev/null || true \
+    && /opt/venv/bin/python3 -m pip install --upgrade pip setuptools wheel uv 2>/dev/null || true \
     && rm -f /usr/bin/python3 /usr/bin/python3-config /usr/bin/pip \
     && ln -sf /opt/venv/bin/python3 /usr/bin/python3 \
     && ln -sf /opt/venv/bin/python3-config /usr/bin/python3-config \

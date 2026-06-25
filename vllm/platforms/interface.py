@@ -245,7 +245,59 @@ class Platform:
             return int(physical_device_id)
         else:
             return device_id
-
+    @classmethod
+    def device_control_id_to_physical_device_id(cls, device_id: str) -> int:
+        """Map one device-control env entry to an integer physical device ID."""
+        try:
+            return int(device_id)
+        except ValueError as e:
+            raise ValueError(
+                f"Non-integer device ID {device_id!r} is not supported by "
+                f"{cls.device_name}."
+            ) from e
+    @classmethod
+    def logical_device_id_to_visible_device_id(cls, device_id: int) -> int:
+        """Map a vLLM-local logical device ID to the current process's
+        visible accelerator ordinal.
+        vLLM internals use logical local IDs. Physical IDs are used only
+        at platform/topology boundaries. This helper performs the final
+        translation needed by APIs such as ``torch.device("cuda:N")``.
+        """
+        physical_device_id = cls.device_id_to_physical_device_id(device_id)
+        device_control_env = os.environ.get(cls.device_control_env_var, "")
+        if not device_control_env:
+            return physical_device_id
+        visible_physical_device_ids = [
+            cls.device_control_id_to_physical_device_id(physical_id)
+            for physical_id in device_control_env.split(",")
+        ]
+        if physical_device_id not in visible_physical_device_ids:
+            raise RuntimeError(
+                f"Physical device {physical_device_id} for logical device "
+                f"{device_id} is not visible in {cls.device_control_env_var}="
+                f"{device_control_env}"
+            )
+        return visible_physical_device_ids.index(physical_device_id)
+    @classmethod
+    def visible_device_id_to_physical_device_id(cls, device_id: int) -> int:
+        """Map a visible accelerator ordinal (e.g. ``torch.device.index``)
+        to a physical device ID.
+        This is the inverse of the env-var translation performed by
+        logical_device_id_to_visible_device_id() and is independent of any
+        logical-to-physical mapping set via set_assigned_physical_gpu_ids().
+        """
+        device_control_env = os.environ.get(cls.device_control_env_var, "")
+        if not device_control_env:
+            return device_id
+        visible_device_ids = device_control_env.split(",")
+        if device_id >= len(visible_device_ids):
+            raise IndexError(
+                f"visible device ordinal {device_id} is out of range for "
+                f"{cls.device_control_env_var}={device_control_env}"
+            )
+        return cls.device_control_id_to_physical_device_id(
+            visible_device_ids[device_id]
+        )
     @classmethod
     def import_kernels(cls) -> None:
         """Import any platform-specific C kernels."""

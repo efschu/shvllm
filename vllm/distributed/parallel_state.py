@@ -440,13 +440,23 @@ class GroupCoordinator:
         self.device_group = self_device_group
 
         from vllm.platforms import current_platform
-
         if current_platform.is_cuda_alike():
-            self.device = torch.device(f"cuda:{local_rank}")
+            visible_device_index = current_platform.logical_device_id_to_visible_device_id(
+                local_rank
+            )
+            self.device = torch.device(f"cuda:{visible_device_index}")
         elif current_platform.is_xpu():
-            self.device = torch.device(f"xpu:{local_rank}")
+            visible_device_index = current_platform.logical_device_id_to_visible_device_id(
+                local_rank
+            )
+            self.device = torch.device(f"xpu:{visible_device_index}")
         elif current_platform.is_out_of_tree():
-            self.device = torch.device(f"{current_platform.device_name}:{local_rank}")
+            visible_device_index = current_platform.logical_device_id_to_visible_device_id(
+                local_rank
+            )
+            self.device = torch.device(
+                f"{current_platform.device_name}:{visible_device_index}"
+            )
         else:
             self.device = torch.device("cpu")
 
@@ -735,6 +745,8 @@ class GroupCoordinator:
         dim: int = 0,
         sizes: list[int] | None = None,
     ):
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
         return self.device_communicator.all_gatherv(input_, dim, sizes)
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
@@ -1519,7 +1531,11 @@ def _init_process_group_for_split_group(
     """
     if torch.accelerator.is_available() and backend != "gloo":
         init_backend = "cpu:gloo,cuda:nccl"
-        device_id: torch.device | None = torch.device(f"cuda:{local_rank}")
+        from vllm.platforms import current_platform
+        visible_device_index = current_platform.logical_device_id_to_visible_device_id(
+            local_rank
+        )
+        device_id: torch.device | None = torch.device(f"cuda:{visible_device_index}")
     else:
         init_backend = "gloo"
         device_id = None

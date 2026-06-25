@@ -173,7 +173,6 @@ RUN mkdir -p "${UV_PYTHON_INSTALL_DIR}" "${UV_CACHE_DIR}" "${UV_INSTALL_DIR}" \
          https://astral.sh/uv/install.sh | \
          UV_INSTALL_DIR=/usr/local sh \
     && python3 -m venv /opt/venv \
-    && /opt/venv/bin/python3 -m pip install --upgrade pip setuptools wheel 2>/dev/null || true \
     && rm -f /usr/bin/python3 /usr/bin/python3-config /usr/bin/pip \
     && ln -sf /opt/venv/bin/python3 /usr/bin/python3 \
     && ln -sf /opt/venv/bin/python3-config /usr/bin/python3-config \

@@ -162,11 +162,14 @@ RUN if [ "${BUILD_OS}" = "manylinux" ]; then \
         && rm -rf /var/lib/apt/lists/*; \
     fi
 
-# Install uv and bootstrap /opt/venv. uv uses tokio which needs /dev/full — blocked in
-# BuildKit sandbox — so we use stdlib venv and keep uv for subsequent pip operations.
+# Install uv and bootstrap /opt/venv. uv binary-install via curl fails DNS in BuildKit,
+# pip-install strips execute bits; so: apt python3-venv + pip uv (to /usr/local/bin OK).
 RUN mkdir -p "${UV_PYTHON_INSTALL_DIR}" "${UV_CACHE_DIR}" "${UV_INSTALL_DIR}" \
     && chmod -R a+rX /opt/uv \
-    && curl -LsSf https://astral.sh/uv/0.11.24/install.sh | sh \
+    && apt-get update -y \
+    && apt-get install -y --no-install-recommends python3-venv python3-pip \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip3 install --break-system-packages uv \
     && python3 -m venv /opt/venv \
     && /opt/venv/bin/python3 -m pip install --upgrade pip setuptools wheel 2>/dev/null || true \
     && rm -f /usr/bin/python3 /usr/bin/python3-config /usr/bin/pip \
@@ -174,9 +177,7 @@ RUN mkdir -p "${UV_PYTHON_INSTALL_DIR}" "${UV_CACHE_DIR}" "${UV_INSTALL_DIR}" \
     && ln -sf /opt/venv/bin/python3-config /usr/bin/python3-config \
     && ln -sf /opt/venv/bin/pip /usr/bin/pip \
     && python3 --version && python3 -m pip --version
-# hardlink failures with BuildKit cache mounts); it must not be set during
-# `uv venv` above, which relies on hardlinking /opt/venv back to the
-# managed Python source so ensurepip / `python3 -m pip` still resolve.
+# UV_LINK_MODE=copy applies to subsequent `uv pip install` RUNs (avoids
 ENV UV_LINK_MODE=copy
 
 # Verify GCC version

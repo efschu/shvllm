@@ -6,15 +6,10 @@ services:
       context: .
       dockerfile: docker/Dockerfile
       args:
-        # Python version
         PYTHON_VERSION: "3.12"
-        # CUDA toolkit version
         CUDA_VERSION: "12.8.0"
-        # Build type: release or debug
         BUILD_TYPE: "release"
-        # Max parallelism for compilation jobs (default: number of CPU cores)
         MAX_JOBS: "32"
-        # Enable CUDA kernels for Blackwell (H100/H200/B100/B200)
         VLLM_INSTALL_WHEEL: "1"
     image: ghcr.io/efschu/vllm:heterogenes_multi_gpu
     platform: linux/amd64
@@ -22,13 +17,12 @@ services:
       - apparmor=unconfined
     privileged: true
     shm_size: "128gb"
-    # Mount NVMe for build cache
     volumes:
       - ./uv-bin:/uv-bin:ro
       - vllm-cache:/root/.cache
       - vllm-cache-ccache:/ccache
     environment:
-      - CUDAARCHS="9.0"  # Ada Lovelace/Hopper
+      - CUDAARCHS="9.0"
       - MAX_JOBS=32
       - UV_LINK_MODE=copy
       - UV_PYTHON_INSTALL_DIR=/opt/uv/python

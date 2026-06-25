@@ -169,8 +169,11 @@ RUN mkdir -p "${UV_PYTHON_INSTALL_DIR}" "${UV_CACHE_DIR}" "${UV_INSTALL_DIR}" \
     && apt-get update -y \
     && apt-get install -y --no-install-recommends python3-venv \
     && rm -rf /var/lib/apt/lists/* \
+    && curl -LsSf --dns-servers 8.8.8.8 \
+         https://astral.sh/uv/install.sh | \
+         UV_INSTALL_DIR=/usr/local sh \
     && python3 -m venv /opt/venv \
-    && /opt/venv/bin/python3 -m pip install uv 2>/dev/null || true \
+    && /opt/venv/bin/python3 -m pip install --upgrade pip setuptools wheel 2>/dev/null || true \
     && rm -f /usr/bin/python3 /usr/bin/python3-config /usr/bin/pip \
     && ln -sf /opt/venv/bin/python3 /usr/bin/python3 \
     && ln -sf /opt/venv/bin/python3-config /usr/bin/python3-config \

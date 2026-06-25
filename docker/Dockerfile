@@ -99,12 +99,6 @@ ARG INSTALL_KV_CONNECTORS=false
 # prepare basic build environment
 FROM ${BUILD_BASE_IMAGE} AS base
 
-ARG CUDA_VERSION
-ARG PYTHON_VERSION
-ARG BUILD_OS
-
-ENV DEBIAN_FRONTEND=noninteractive
-
 # Environment for uv
 # Declared BEFORE the installer + `uv venv` invocations below so the uv
 # binary, managed Python, download cache, and /opt/venv all land under
@@ -139,8 +133,8 @@ RUN if [ "${BUILD_OS}" = "manylinux" ]; then \
         && dnf clean all \
         && rm -rf /var/cache/dnf; \
     else \
-        apt-get update -y \
-        && apt-get install -y --no-install-recommends \
+        DEBIAN_FRONTEND=noninteractive apt-get update -y \
+        && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             ccache \
             software-properties-common \
             git \
@@ -158,28 +152,31 @@ RUN if [ "${BUILD_OS}" = "manylinux" ]; then \
         # Install python dev headers if available (needed for cmake FindPython on Ubuntu 24.04
         # which ships cmake 3.28 and requires Development.SABIModule; silently skipped on
         # Ubuntu 20.04/22.04 where python3.x-dev is not available without a PPA)
-        && (apt-get install -y --no-install-recommends python${PYTHON_VERSION}-dev 2>/dev/null || true) \
+        && (DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python${PYTHON_VERSION}-dev 2>/dev/null || true) \
         && rm -rf /var/lib/apt/lists/*; \
     fi
 
-# Install uv and bootstrap /opt/venv. uv binary-install via curl fails DNS in BuildKit,
-# pip-install strips execute bits; so: apt python3-venv + pip uv (to /usr/local/bin OK).
-# uv's install.sh creates a managed Python under /opt/uv/python/ — must be done AFTER
-# python3-venv symlinks are redirected so /opt/uv isn't confused with system Python.
-RUN mkdir -p "${UV_PYTHON_INSTALL_DIR}" "${UV_CACHE_DIR}" "${UV_INSTALL_DIR}" \
+# Install uv and bootstrap /opt/venv. uv binaries are pre-loaded in the build
+# context at uv-bin/ to avoid DNS/network issues in BuildKit and to bypass
+# install.sh's managed-Python symlink loop that would break python3-venv above.
+COPY uv-bin/uv /usr/local/bin/uv
+COPY uv-bin/uvx /usr/local/bin/uvx
+# NOTE: ENV PATH="/opt/venv/bin:..." is already set globally, putting /opt/venv/bin
+# before /usr/bin. This RUN would therefore find the broken /opt/venv/bin/python3
+# symlink (just created then removed) instead of the real /usr/bin/python3, causing
+# "Too many levels of symbolic links". Inline PATH override fixes this.
+RUN PATH="/usr/bin:/opt/uv/bin:$PATH" \
+    mkdir -p "${UV_PYTHON_INSTALL_DIR}" "${UV_CACHE_DIR}" "${UV_INSTALL_DIR}" \
     && chmod -R a+rX /opt/uv \
-    && apt-get update -y \
-    && apt-get install -y --no-install-recommends python3-venv \
+    && DEBIAN_FRONTEND=noninteractive apt-get update -y \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-venv \
     && rm -rf /var/lib/apt/lists/* \
     && python3 -m venv /opt/venv \
     && rm -f /usr/bin/python3 /usr/bin/python3-config /usr/bin/pip \
     && ln -sf /opt/venv/bin/python3 /usr/bin/python3 \
     && ln -sf /opt/venv/bin/python3-config /usr/bin/python3-config \
     && ln -sf /opt/venv/bin/pip /usr/bin/pip \
-    && curl -LsSf --dns-servers 8.8.8.8 \
-         https://astral.sh/uv/install.sh | \
-         UV_INSTALL_DIR=/usr/local sh \
-    && python3 --version && python3 -m pip --version
+    && uv --version && /usr/bin/python3 --version && /usr/bin/python3 -m pip --version
 ENV UV_LINK_MODE=copy
 
 # Verify GCC version

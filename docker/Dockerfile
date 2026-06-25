@@ -22,7 +22,7 @@
 #   docker buildx bake -f docker/docker-bake.hcl -f docker/versions.json
 # =============================================================================
 
-ARG CUDA_VERSION=13.0.2
+ARG CUDA_VERSION=12.8.0
 ARG PYTHON_VERSION=3.12
 ARG UBUNTU_VERSION=22.04
 
@@ -133,27 +133,35 @@ RUN if [ "${BUILD_OS}" = "manylinux" ]; then \
         && dnf clean all \
         && rm -rf /var/cache/dnf; \
     else \
+        # Layer 1: packages with no Python dependency. Cached even if deadsnakes
+        # below fails due to DNS/unreachable PPA.
         DEBIAN_FRONTEND=noninteractive apt-get update -y \
         && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             ccache \
-            software-properties-common \
             git \
             curl \
             sudo \
-            python3-pip \
             libibverbs-dev \
-            # GCC 10 was previously pinned to suppress spurious -Wredundant-move warnings
-            # from CUTLASS (https://gcc.gnu.org/bugzilla/show_bug.cgi?id=92519). That bug
-            # was fixed in GCC 11. GCC >= 11.3 is now required because PyTorch's C++20 headers
-            # (pytorch/pytorch#167929) are not compatible with GCC < 11.3.
             gcc-11 \
             g++-11 \
+            libgcc-11-dev \
+            libstdc++-11-dev \
         && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-11 110 --slave /usr/bin/g++ g++ /usr/bin/g++-11 \
-        # Install python dev headers if available (needed for cmake FindPython on Ubuntu 24.04
-        # which ships cmake 3.28 and requires Development.SABIModule; silently skipped on
-        # Ubuntu 20.04/22.04 where python3.x-dev is not available without a PPA)
-        && (DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python${PYTHON_VERSION}-dev 2>/dev/null || true) \
         && rm -rf /var/lib/apt/lists/*; \
+        # Layer 2: try deadsnakes via curl (fails silently if DNS unreachable)
+        curl -fsSL "https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu/pool/main/d/deadsnakes-archive-keyring/deadsnakes-archive-keyring_2024.10.22_all.deb" \
+            -o /tmp/ds.deb \
+        && dpkg -i /tmp/ds.deb \
+        && printf 'deb https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu jammy main\n' \
+            > /etc/apt/sources.list.d/deadsnakes.list \
+        && apt-get update -y \
+        && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            software-properties-common \
+            "python${PYTHON_VERSION}" \
+            "python${PYTHON_VERSION}-dev" \
+            "python${PYTHON_VERSION}-venv" \
+        && rm -rf /var/lib/apt/lists/* \
+        || echo "deadsnakes PPA unreachable; Python will be provided by uv python install below"; \
     fi
 
 # Install uv and bootstrap /opt/venv. uv binaries are pre-loaded in the build
@@ -168,15 +176,15 @@ COPY uv-bin/uvx /usr/local/bin/uvx
 RUN PATH="/usr/bin:/opt/uv/bin:$PATH" \
     mkdir -p "${UV_PYTHON_INSTALL_DIR}" "${UV_CACHE_DIR}" "${UV_INSTALL_DIR}" \
     && chmod -R a+rX /opt/uv \
-    && DEBIAN_FRONTEND=noninteractive apt-get update -y \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-venv \
-    && rm -rf /var/lib/apt/lists/* \
-    && python3 -m venv /opt/venv \
+    && uv --version \
+    && uv python install ${PYTHON_VERSION} \
+    && uv venv --python ${PYTHON_VERSION} /opt/venv \
+    && uv pip install --python /opt/venv/bin/python pip \
     && rm -f /usr/bin/python3 /usr/bin/python3-config /usr/bin/pip \
     && ln -sf /opt/venv/bin/python3 /usr/bin/python3 \
     && ln -sf /opt/venv/bin/python3-config /usr/bin/python3-config \
     && ln -sf /opt/venv/bin/pip /usr/bin/pip \
-    && uv --version && /usr/bin/python3 --version && /usr/bin/python3 -m pip --version
+    && /usr/bin/python3 --version && /usr/bin/python3 -m pip --version
 ENV UV_LINK_MODE=copy
 
 # Verify GCC version

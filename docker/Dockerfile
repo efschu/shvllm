@@ -173,7 +173,8 @@ COPY uv-bin/uvx /usr/local/bin/uvx
 # before /usr/bin. This RUN would therefore find the broken /opt/venv/bin/python3
 # symlink (just created then removed) instead of the real /usr/bin/python3, causing
 # "Too many levels of symbolic links". Inline PATH override fixes this.
-RUN PATH="/usr/bin:/opt/uv/bin:$PATH" \
+RUN --privileged \
+    PATH="/usr/bin:/opt/uv/bin:$PATH" \
     mkdir -p "${UV_PYTHON_INSTALL_DIR}" "${UV_CACHE_DIR}" "${UV_INSTALL_DIR}" \
     && chmod -R a+rX /opt/uv \
     && uv --version \

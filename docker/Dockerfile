@@ -164,21 +164,22 @@ RUN if [ "${BUILD_OS}" = "manylinux" ]; then \
 
 # Install uv and bootstrap /opt/venv. uv binary-install via curl fails DNS in BuildKit,
 # pip-install strips execute bits; so: apt python3-venv + pip uv (to /usr/local/bin OK).
+# uv's install.sh creates a managed Python under /opt/uv/python/ — must be done AFTER
+# python3-venv symlinks are redirected so /opt/uv isn't confused with system Python.
 RUN mkdir -p "${UV_PYTHON_INSTALL_DIR}" "${UV_CACHE_DIR}" "${UV_INSTALL_DIR}" \
     && chmod -R a+rX /opt/uv \
     && apt-get update -y \
     && apt-get install -y --no-install-recommends python3-venv \
     && rm -rf /var/lib/apt/lists/* \
-    && curl -LsSf --dns-servers 8.8.8.8 \
-         https://astral.sh/uv/install.sh | \
-         UV_INSTALL_DIR=/usr/local sh \
     && python3 -m venv /opt/venv \
     && rm -f /usr/bin/python3 /usr/bin/python3-config /usr/bin/pip \
     && ln -sf /opt/venv/bin/python3 /usr/bin/python3 \
     && ln -sf /opt/venv/bin/python3-config /usr/bin/python3-config \
     && ln -sf /opt/venv/bin/pip /usr/bin/pip \
+    && curl -LsSf --dns-servers 8.8.8.8 \
+         https://astral.sh/uv/install.sh | \
+         UV_INSTALL_DIR=/usr/local sh \
     && python3 --version && python3 -m pip --version
-# UV_LINK_MODE=copy applies to subsequent `uv pip install` RUNs (avoids
 ENV UV_LINK_MODE=copy
 
 # Verify GCC version

@@ -166,12 +166,7 @@ RUN if [ "${BUILD_OS}" = "manylinux" ]; then \
 # downstream stages stay distro-agnostic.
 RUN mkdir -p "${UV_PYTHON_INSTALL_DIR}" "${UV_CACHE_DIR}" "${UV_INSTALL_DIR}" \
     && chmod -R a+rX /opt/uv \
-    && apt-get update -y \
-    && apt-get install -y --no-install-recommends python3-pip \
-    && rm -rf /var/lib/apt/lists/* \
-    && pip3 install --target /opt/uv/bin uv \
-    && chmod +x /opt/uv/bin/uv \
-    && PATH="/opt/uv/bin:$PATH" \
+    && curl -LsSf --dns-servers 8.8.8.8,1.1.1.1 https://astral.sh/uv/install.sh | sh \
     # `--seed` installs pip/setuptools/wheel into the venv so `python3 -m
     # pip` works regardless of how uv happens to link the venv back to the
     # managed Python install (which, at a non-default UV_PYTHON_INSTALL_DIR,
@@ -181,9 +176,9 @@ RUN mkdir -p "${UV_PYTHON_INSTALL_DIR}" "${UV_CACHE_DIR}" "${UV_INSTALL_DIR}" \
            # at the matching interpreter rather than letting it fetch one.
            PYV_NODOT=$(echo ${PYTHON_VERSION} | tr -d '.') \
            && MANYLINUX_PY=/opt/python/cp${PYV_NODOT}-cp${PYV_NODOT}/bin/python${PYTHON_VERSION} \
-           && /opt/uv/bin/uv venv --seed /opt/venv --python "$MANYLINUX_PY"; \
+           && uv venv --seed /opt/venv --python "$MANYLINUX_PY"; \
        else \
-           /opt/uv/bin/uv venv --seed /opt/venv --python ${PYTHON_VERSION}; \
+           uv venv --seed /opt/venv --python ${PYTHON_VERSION}; \
        fi \
     && rm -f /usr/bin/python3 /usr/bin/python3-config /usr/bin/pip \
     && ln -sf /opt/venv/bin/python3 /usr/bin/python3 \

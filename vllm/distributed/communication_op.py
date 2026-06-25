@@ -15,10 +15,21 @@ def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
 
 
 def tensor_model_parallel_all_gather(
-    input_: torch.Tensor, dim: int = -1
+    input_: torch.Tensor,
+    dim: int = -1,
+    partition_sizes: list[int] | None = None,
 ) -> torch.Tensor:
-    """All-gather the input tensor across model parallel group."""
-    return get_tp_group().all_gather(input_, dim)
+    """All-gather the input tensor across model parallel group.
+
+    Under heterogeneous TP, the actual pad-gather-slice logic lives in
+    :meth:`GroupCoordinator.all_gather`; this helper just forwards the
+    optional ``partition_sizes`` so callers that need a dim-specific split
+    (e.g. the LM head's vocab dim) don't have to set the global. When
+    ``partition_sizes`` is ``None``, the global ``_TP_PARTITION_SIZES`` is
+    consulted; when that's also unset the legacy equal-chunk ``all_gather``
+    runs.
+    """
+    return get_tp_group().all_gather(input_, dim, partition_sizes)
 
 
 def tensor_model_parallel_reduce_scatter(

@@ -7,7 +7,7 @@ import torch
 import torch.types
 
 from vllm.lora.peft_helper import PEFTHelper
-from vllm.utils.torch_utils import PIN_MEMORY
+from vllm.utils.platform_utils import is_pin_memory_available
 
 
 class LoRALayerWeights:
@@ -79,7 +79,7 @@ class LoRALayerWeights:
         dtype: torch.dtype,
         device: torch.types.Device,
     ) -> "LoRALayerWeights":
-        pin_memory = str(device) == "cpu" and PIN_MEMORY
+        pin_memory = str(device) == "cpu" and is_pin_memory_available()
         lora_a = torch.zeros(
             [rank, input_dim], dtype=dtype, device=device, pin_memory=pin_memory
         )

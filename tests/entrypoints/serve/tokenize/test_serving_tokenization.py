@@ -10,12 +10,12 @@ import pytest
 from vllm.config.multimodal import MultiModalConfig
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
+from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 from vllm.entrypoints.serve.tokenize.protocol import (
     TokenizeChatRequest,
     TokenizeCompletionRequest,
 )
-from vllm.entrypoints.serve.tokenize.serving import ServingTokenization
-from vllm.renderers.online_renderer import OnlineRenderer
+from vllm.entrypoints.serve.tokenize.serving import OpenAIServingTokenization
 from vllm.v1.engine.async_llm import AsyncLLM
 
 MODEL_NAME = "openai-community/gpt2"
@@ -58,21 +58,24 @@ class MockModelConfig:
         return self.diff_sampling_param or {}
 
 
-def _build_serving_tokenization(engine: AsyncLLM) -> ServingTokenization:
+def _build_serving_tokenization(engine: AsyncLLM) -> OpenAIServingTokenization:
     models = OpenAIServingModels(
         engine_client=engine,
         base_model_paths=BASE_MODEL_PATHS,
     )
-    online_renderer = OnlineRenderer(
+    serving_render = OpenAIServingRender(
         model_config=engine.model_config,
         renderer=engine.renderer,
+        model_registry=models.registry,
         request_logger=None,
         chat_template=None,
         chat_template_content_format="auto",
     )
-    return ServingTokenization(
+    return OpenAIServingTokenization(
+        engine,
         models,
-        online_renderer=online_renderer,
+        openai_serving_render=serving_render,
+        request_logger=None,
         chat_template=None,
         chat_template_content_format="auto",
     )
@@ -87,7 +90,7 @@ async def test_tokenize_chat_skips_mm_cache_for_renderer_only_path():
     mock_engine.renderer = MagicMock()
 
     serving = _build_serving_tokenization(mock_engine)
-    serving.online_renderer.preprocess_chat = AsyncMock(
+    serving.openai_serving_render.preprocess_chat = AsyncMock(
         return_value=(
             [{"role": "user", "content": "Test"}],
             [{"prompt_token_ids": [1, 2, 3]}],
@@ -103,7 +106,7 @@ async def test_tokenize_chat_skips_mm_cache_for_renderer_only_path():
 
     assert response.tokens == [1, 2, 3]
     assert (
-        serving.online_renderer.preprocess_chat.call_args.kwargs["skip_mm_cache"]
+        serving.openai_serving_render.preprocess_chat.call_args.kwargs["skip_mm_cache"]
         is True
     )
 
@@ -117,7 +120,7 @@ async def test_tokenize_completion_skips_mm_cache_for_renderer_only_path():
     mock_engine.renderer = MagicMock()
 
     serving = _build_serving_tokenization(mock_engine)
-    serving.online_renderer.preprocess_completion = AsyncMock(
+    serving.openai_serving_render.preprocess_completion = AsyncMock(
         return_value=[{"prompt_token_ids": [1, 2, 3]}]
     )
 
@@ -130,6 +133,8 @@ async def test_tokenize_completion_skips_mm_cache_for_renderer_only_path():
 
     assert response.tokens == [1, 2, 3]
     assert (
-        serving.online_renderer.preprocess_completion.call_args.kwargs["skip_mm_cache"]
+        serving.openai_serving_render.preprocess_completion.call_args.kwargs[
+            "skip_mm_cache"
+        ]
         is True
     )

@@ -3,6 +3,7 @@
 import contextlib
 import importlib.metadata
 import os
+import platform
 import random
 import threading
 from collections.abc import Callable, Collection
@@ -17,7 +18,6 @@ from torch.library import Library, infer_schema
 
 import vllm.envs as envs
 from vllm.logger import init_logger
-from vllm.utils.platform_utils import is_pin_memory_available
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
@@ -39,7 +39,6 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "fp8_e4m3": torch.uint8,
     "fp8_e5m2": torch.uint8,
     "int8": torch.int8,
-    "int4_per_token_head": torch.uint8,
     "int8_per_token_head": torch.int8,
     "fp8_per_token_head": torch.uint8,
     "fp8_inc": torch.float8_e4m3fn,
@@ -69,7 +68,9 @@ MODELOPT_TO_VLLM_KV_CACHE_DTYPE_MAP = {
 T = TypeVar("T")
 
 
-PIN_MEMORY = is_pin_memory_available()
+# Pin memory in non-WSL case.
+# Logic duplicated here for now to avoid circular import.
+PIN_MEMORY = "microsoft" not in " ".join(platform.uname()).lower()
 
 
 def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
@@ -605,24 +606,14 @@ def create_kv_caches_with_random(
 
 
 def async_tensor_h2d(
-    data: list | np.ndarray | torch.Tensor,
+    data: list,
+    dtype: torch.dtype,
     device: str | torch.device,
-    dtype: torch.dtype | None = None,
+    pin_memory: bool = PIN_MEMORY,
 ) -> torch.Tensor:
-    """Copy list/numpy array/tensor async from host to device."""
-    if isinstance(data, np.ndarray):
-        data = torch.from_numpy(data)
-    if isinstance(data, torch.Tensor):
-        t = data.pin_memory() if PIN_MEMORY else data
-    else:
-        t = torch.tensor(data, dtype=dtype, pin_memory=PIN_MEMORY, device="cpu")
-    assert t.is_cpu
-    return t.to(device=device, dtype=dtype, non_blocking=True)
-
-
-def np_to_pinned_tensor(array: np.ndarray) -> torch.Tensor:
-    t = torch.from_numpy(array)
-    return t.pin_memory() if PIN_MEMORY else t
+    """Asynchronously create a tensor and copy it from host to device."""
+    t = torch.tensor(data, dtype=dtype, pin_memory=pin_memory, device="cpu")
+    return t.to(device=device, non_blocking=True)
 
 
 def make_ndarray_with_pad(
@@ -921,6 +912,11 @@ def _resolve_layer_name(layer_name: str | LayerName) -> str:
 def _encode_layer_name(layer_name: str) -> str | LayerName:
     """Wrap a str layer name as LayerName when enabled."""
     return LayerName(layer_name) if _USE_LAYERNAME else layer_name
+
+
+# Supports xccl with PyTorch versions >= 2.8.0.dev for XPU platform
+def supports_xccl() -> bool:
+    return torch.distributed.is_xccl_available()
 
 
 # Supports XPU Graph with PyTorch versions >= 2.11.0.dev for XPU platform

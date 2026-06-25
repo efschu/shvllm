@@ -12,6 +12,7 @@ from multiprocessing import Process, connection
 from multiprocessing.process import BaseProcess
 from multiprocessing.queues import Queue
 from typing import TYPE_CHECKING, cast
+from unittest.mock import patch
 
 import msgspec
 import zmq
@@ -174,38 +175,38 @@ class CoreEngineProcManager:
         self.manager_stopped = threading.Event()
         self.failed_proc_name: str | None = None
 
-        # All ranks share this config object: capture the user-provided
-        # --device-ids list before the per-rank shard overwrites it. Mutating
-        # the config before each proc.start() works because the spawn method
-        # pickles process args at start() time, sequentially per rank.
-        user_assigned_gpu_ids = vllm_config.parallel_config.assigned_physical_gpu_ids
         try:
             for proc, local_dp_rank in zip(self.processes, local_dp_ranks):
-                # Populate the logical-to-physical GPU mapping in DP for
-                # platforms that cannot rely on
-                # torch.accelerator.set_device_index(), and for Ray.
+                # Adjust device control in DP for platforms that cannot rely
+                # on torch.accelerator.set_device_index(), and for Ray launchers.
+                device_control_context: contextlib.AbstractContextManager[None] = (
+                    contextlib.nullcontext()
+                )
                 needs_device_env_isolation = not (
                     current_platform.is_cuda_alike() or current_platform.is_xpu()
                 )
                 if is_dp and (
                     needs_device_env_isolation or vllm_config.parallel_config.use_ray
                 ):
-                    set_assigned_physical_gpu_ids_for_dp_rank(
-                        vllm_config, local_dp_rank, user_assigned_gpu_ids
+                    device_control_context = set_device_control_env_var(
+                        vllm_config, local_dp_rank
                     )
 
-                with numa_utils.configure_subprocess(
-                    # EngineCore itself does not have a TP/PP-local rank.
-                    # When DP is enabled, set_assigned_physical_gpu_ids_for_dp_rank()
-                    # populates the logical-to-physical mapping for this DP
-                    # shard, so local_rank=0 means "the first local GPU in
-                    # this shard". The actual TP/PP worker processes spawned
-                    # by the executor are bound separately with their own
-                    # local_rank values.
-                    vllm_config,
-                    local_rank=0,
-                    dp_local_rank=local_dp_rank,
-                    process_kind="EngineCore",
+                with (
+                    device_control_context,
+                    numa_utils.configure_subprocess(
+                        # EngineCore itself does not have a TP/PP-local rank.
+                        # When DP is enabled, set_device_control_env_var()
+                        # narrows visible devices to this DP shard first, so
+                        # local_rank=0 means "the first local GPU in this
+                        # shard". The actual TP/PP worker processes spawned by
+                        # the executor are bound separately with their own
+                        # local_rank values.
+                        vllm_config,
+                        local_rank=0,
+                        dp_local_rank=local_dp_rank,
+                        process_kind="EngineCore",
+                    ),
                 ):
                     proc.start()
         finally:
@@ -280,79 +281,55 @@ class SignalCallback:
         self._event.set()
 
 
-def set_assigned_physical_gpu_ids_for_dp_rank(
-    vllm_config: VllmConfig,
-    local_dp_rank: int,
-    user_assigned_gpu_ids: list[int] | None = None,
-) -> None:
+@contextlib.contextmanager
+def set_device_control_env_var(
+    vllm_config: VllmConfig, local_dp_rank: int
+) -> Iterator[None]:
     """
-    Populate assigned_physical_gpu_ids on the config for the given DP rank.
-
-    user_assigned_gpu_ids is the full (un-sharded) --device-ids list, if the
-    user provided one; this DP rank's shard is sliced from it. It is passed
-    explicitly rather than read from the config because callers may reuse
-    one config object across DP ranks, overwriting the field each time.
+    Temporarily set CUDA_VISIBLE_DEVICES or equivalent
+    for engine subprocess.
     """
     world_size = vllm_config.parallel_config.world_size
     local_world_size = vllm_config.parallel_config.local_world_size
     evar = current_platform.device_control_env_var
 
-    physical_gpu_ids = get_physical_gpu_ids_for_local_dp_rank(
-        evar,
-        local_dp_rank,
-        world_size,
-        local_world_size,
-        user_assigned_gpu_ids=user_assigned_gpu_ids,
-    )
-    vllm_config.parallel_config.assigned_physical_gpu_ids = physical_gpu_ids
+    value = get_device_indices(evar, local_dp_rank, world_size, local_world_size)
+    with patch.dict(os.environ, values=((evar, value),)):
+        yield
 
 
-def get_physical_gpu_ids_for_local_dp_rank(
+def get_device_indices(
     device_control_env_var: str,
     local_dp_rank: int,
     world_size: int,
     local_world_size: int | None = None,
-    user_assigned_gpu_ids: list[int] | None = None,
-) -> list[int]:
+):
     """
-    Returns list of physical GPU IDs for the specified
+    Returns a comma-separated string of device indices for the specified
     data parallel rank.
 
     For example, if world_size=2 and local_dp_rank=1, and there are 4 devices,
-    this will return [2, 3] for local_dp_rank=1.
-
-    If user_assigned_gpu_ids is provided (e.g. from --device-ids), this DP
-    rank's shard is sliced from it instead of being derived from the
-    device-control env var.
+    this will select devices 2 and 3 for local_dp_rank=1.
     """
     if local_world_size is None:
         local_world_size = world_size
-    if user_assigned_gpu_ids is not None:
-        start = local_dp_rank * world_size
-        stop = start + local_world_size
-        if stop > len(user_assigned_gpu_ids):
-            raise ValueError(
-                f"--device-ids provides {len(user_assigned_gpu_ids)} devices, "
-                f"but DP rank {local_dp_rank} needs devices [{start}, {stop})"
-            )
-        return user_assigned_gpu_ids[start:stop]
     try:
-        return [
-            current_platform.device_id_to_physical_device_id(i)
+        value = ",".join(
+            str(current_platform.device_id_to_physical_device_id(i))
             for i in range(
                 local_dp_rank * world_size,
                 local_dp_rank * world_size + local_world_size,
             )
-        ]
+        )
     except IndexError as e:
         raise Exception(
-            f"Error computing device indices for "
-            f"{device_control_env_var}: "
+            f"Error setting {device_control_env_var}: "
             f"local range: [{local_dp_rank * world_size}, "
             f"{(local_dp_rank + 1) * world_size}) "
             "base value: "
             f'"{os.getenv(device_control_env_var)}"'
         ) from e
+    return value
 
 
 def _apply_dp_identity_suffix(dp_vllm_config, dp_rank: int) -> None:
@@ -476,11 +453,11 @@ class CoreEngineActorManager:
             # https://github.com/ray-project/ray/blob/master/python/ray/_private/accelerators/intel_gpu.py#L56 # noqa: E501
             if current_platform.is_xpu():
                 device_evar = current_platform.device_control_env_var
-                physical_gpu_ids = get_physical_gpu_ids_for_local_dp_rank(
+                device_indices = get_device_indices(
                     device_evar, local_index, world_size
                 )
                 actor_env_vars = self.env_vars_dict.copy()
-                actor_env_vars[device_evar] = ",".join(str(d) for d in physical_gpu_ids)
+                actor_env_vars[device_evar] = device_indices
                 runtime_env = RuntimeEnv(env_vars=actor_env_vars)
 
             actor = (

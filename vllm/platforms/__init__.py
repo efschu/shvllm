@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 from vllm import envs
 from vllm.plugins import PLATFORM_PLUGINS_GROUP, load_plugins_by_group
 from vllm.utils.import_utils import resolve_obj_by_qualname
+from vllm.utils.torch_utils import supports_xccl
 
 from .interface import CpuArchEnum, Platform, PlatformEnum
 
@@ -134,7 +135,7 @@ def xpu_platform_plugin() -> str | None:
     try:
         import torch
 
-        if torch.distributed.is_xccl_available():
+        if supports_xccl():
             dist_backend = "xccl"
             from vllm.platforms.xpu import XPUPlatform
 
@@ -186,7 +187,7 @@ def cpu_platform_plugin() -> str | None:
         try:
             import zentorch  # noqa: F401
 
-            logger.info(
+            logger.debug(
                 "AMD Zen CPU detected with zentorch installed, using ZenCpuPlatform."
             )
             return "vllm.platforms.zen_cpu.ZenCpuPlatform"

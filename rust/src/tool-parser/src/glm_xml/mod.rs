@@ -5,7 +5,7 @@ use winnow::stream::Partial;
 use winnow::token::{literal, rest, take_until, take_while};
 
 use super::parameters::ToolSchemas;
-use super::utils::{MarkerScanState, parse_buffered_event, safe_text_len, take_until_marker};
+use super::utils::{parse_buffered_event, safe_text_len};
 use super::{Result, ToolCallDelta, ToolParserOutput};
 use crate::Tool;
 
@@ -24,10 +24,10 @@ const ARG_VALUE_END: &str = "</arg_value>";
 
 type GlmInput<'i> = Partial<&'i str>;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GlmMode {
     Text,
-    ToolCall { tool_call_end_scan: MarkerScanState },
+    ToolCall,
     AfterToolCall,
 }
 
@@ -81,11 +81,7 @@ impl GlmXmlToolParser {
             GlmEvent::Text { len: consumed_len } => {
                 output.normal_text.push_str(&self.buffer[..consumed_len]);
             }
-            GlmEvent::ToolCallStart => {
-                self.mode = GlmMode::ToolCall {
-                    tool_call_end_scan: MarkerScanState::default(),
-                };
-            }
+            GlmEvent::ToolCallStart => self.mode = GlmMode::ToolCall,
             GlmEvent::ToolCall { name, raw_params } => {
                 self.mode = GlmMode::AfterToolCall;
                 let arguments = self.tool_parameters.convert_params_with_schema(&name, raw_params);
@@ -114,7 +110,7 @@ impl GlmXmlToolParser {
         self.buffer.push_str(chunk);
 
         while let Some((event, consumed_len)) = parse_buffered_event(&self.buffer, |input| {
-            parse_next_glm_event(input, &mut self.mode, self.separator)
+            parse_next_glm_event(input, self.mode, self.separator)
         })? {
             self.apply_event(event, output)?;
             self.buffer.drain(..consumed_len);
@@ -128,9 +124,7 @@ impl GlmXmlToolParser {
         if !self.buffer.is_empty() {
             match self.mode {
                 GlmMode::Text => output.normal_text.push_str(&self.buffer),
-                GlmMode::ToolCall { .. } => {
-                    return Err(parsing_failed!("incomplete GLM MoE tool call"));
-                }
+                GlmMode::ToolCall => return Err(parsing_failed!("incomplete GLM MoE tool call")),
                 GlmMode::AfterToolCall => {}
             }
         }
@@ -142,14 +136,12 @@ impl GlmXmlToolParser {
 /// Parse a GLM event for the current parser mode.
 fn parse_next_glm_event(
     input: &mut GlmInput<'_>,
-    mode: &mut GlmMode,
+    mode: GlmMode,
     separator: Separator,
 ) -> ModalResult<GlmEvent> {
     match mode {
         GlmMode::Text => parse_text_event(input),
-        GlmMode::ToolCall { tool_call_end_scan } => {
-            tool_call_event(input, separator, tool_call_end_scan)
-        }
+        GlmMode::ToolCall => tool_call_event(input, separator),
         GlmMode::AfterToolCall => after_tool_call_event(input),
     }
 }
@@ -181,13 +173,9 @@ fn ignored_rest_event(input: &mut GlmInput<'_>) -> ModalResult<GlmEvent> {
 }
 
 /// Parse a complete GLM tool call.
-fn tool_call_event(
-    input: &mut GlmInput<'_>,
-    separator: Separator,
-    tool_call_end_scan: &mut MarkerScanState,
-) -> ModalResult<GlmEvent> {
+fn tool_call_event(input: &mut GlmInput<'_>, separator: Separator) -> ModalResult<GlmEvent> {
     let (body,) = seq!(
-        take_until_marker(TOOL_CALL_END, tool_call_end_scan),
+        take_until(0.., TOOL_CALL_END),
         _: literal(TOOL_CALL_END),
     )
     .parse_next(input)?;

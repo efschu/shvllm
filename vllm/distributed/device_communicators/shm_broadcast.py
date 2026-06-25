@@ -840,13 +840,7 @@ class MessageQueue:
             The MessageQueue instance for the calling process,
             and a list of handles (only non-empty for the reader process).
         """
-        from vllm.platforms.interface import get_assigned_physical_gpu_ids
-
-        assigned_physical_gpu_ids = get_assigned_physical_gpu_ids()
-        if assigned_physical_gpu_ids is not None:
-            local_size = len(assigned_physical_gpu_ids)
-        else:
-            local_size = current_platform.device_count()
+        local_size = current_platform.device_count()
         rank = dist.get_rank()
         same_node = rank // local_size == reader_rank // local_size
         buffer_io = MessageQueue(

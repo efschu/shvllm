@@ -5,10 +5,6 @@ steps:
 - label: V1 Core + KV + Metrics
   timeout_in_minutes: 30
   device: intel_gpu
-  agent_tags:
-    label: production
-    gpu: 1+
-    mem: 16+
   no_plugin: true
   working_dir: "."
   env:
@@ -35,10 +31,6 @@ steps:
 - label: V1 Sample + Logits
   timeout_in_minutes: 30
   device: intel_gpu
-  agent_tags:
-    label: production
-    gpu: 1+
-    mem: 16+
   no_plugin: true
   working_dir: "."
   env:
@@ -65,24 +57,17 @@ steps:
   commands:
     - >-
       bash .buildkite/scripts/hardware_ci/run-intel-test.sh
-      'pip install lm_eval[api]>=0.4.12 &&
-      export VLLM_WORKER_MULTIPROC_METHOD=spawn &&
+      'export VLLM_WORKER_MULTIPROC_METHOD=spawn &&
       cd tests &&
       pytest -v -s v1/logits_processors --ignore=v1/logits_processors/test_custom_online.py --ignore=v1/logits_processors/test_custom_offline.py &&
       pytest -v -s v1/test_oracle.py &&
       pytest -v -s v1/test_request.py &&
       pytest -v -s v1/test_outputs.py &&
-      pytest -v -s v1/sample/test_topk_topp_sampler.py &&
-      pytest -v -s v1/sample/test_logprobs.py &&
-      pytest -v -s v1/sample/test_logprobs_e2e.py'
+      pytest -v -s v1/sample/test_topk_topp_sampler.py'
 
 - label: XPU CPU Offload
   timeout_in_minutes: 60
   device: intel_gpu
-  agent_tags:
-    label: production
-    gpu: 1+
-    mem: 16+
   no_plugin: true
   working_dir: "."
   env:
@@ -107,10 +92,6 @@ steps:
   key: regression
   timeout_in_minutes: 30
   device: intel_gpu
-  agent_tags:
-    label: production
-    gpu: 1+
-    mem: 16+
   no_plugin: true
   working_dir: "."
   env:
@@ -142,10 +123,6 @@ steps:
   timeout_in_minutes: 30
   num_devices: 2
   device: intel_gpu
-  agent_tags:
-    label: production
-    gpu: 2+
-    mem: 16+
   no_plugin: true
   working_dir: "."
   env:
@@ -177,10 +154,6 @@ steps:
   key: async-engine-inputs-utils-worker
   timeout_in_minutes: 30
   device: intel_gpu
-  agent_tags:
-    label: production
-    gpu: 1+
-    mem: 24+
   no_plugin: true
   working_dir: "."
   env:

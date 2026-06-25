@@ -304,15 +304,9 @@ review process:
   resources. The reviewer will add `ready` label to the PR when the PR is
   ready to merge or a full CI run is needed.
 
-### Pull Request Limits and Escalation
+### Escalating Stalled Contributions
 
-vLLM uses GitHub's [pull request limit](https://github.blog/open-source/maintainers/how-pull-request-limits-are-cutting-down-the-noise/)
-for contributors without write access. The current cap is 6 open PRs. If this
-blocks well-intentioned critical work, contact a committer to request bypass
-list access.
-
-If you need an expedited review for an important contribution, please email us
-at:
+If you have an important contribution that has not yet received maintainer attention, please email us at:
 
 <pr-review-request@vllm.ai>
 

@@ -5,18 +5,19 @@ import itertools
 from abc import abstractmethod
 
 import torch
-from torch.nn.parameter import Parameter
+from torch.nn.parameter import Parameter, UninitializedParameter
 
 import vllm.envs as envs
+
 from vllm.distributed import (
     divide,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_partition_sizes_or_uniform,
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
-from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.batch_invariant import (
     linear_batch_invariant,
@@ -46,8 +47,8 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "UnquantizedLinearMethod",
     "CompressedTensorsLinearMethod",
     "CompressedTensorsLinearTransformMethod",
-    "AutoAWQMarlinLinearMethod",
-    "AutoAWQLinearMethod",
+    "AWQMarlinLinearMethod",
+    "AWQLinearMethod",
     "AutoGPTQLinearMethod",
     "Fp8LinearMethod",
     "FBGEMMFp8LinearMethod",
@@ -192,8 +193,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
         # This method creates unquantized linear weights.
         # The weights are not quantized, and they are not sharded.
         # The amount of memory allocated for the weights is
-        # sum(output_partition_sizes) * input_size_per_partition.
         weight_loader = extra_weight_attrs.pop("weight_loader")
+        # ``tp_partition_sizes_output``/``tp_partition_sizes_input`` drive
+        # the parameter's heterogeneous-TP slicing. Under uniform TP they
+        # collapse to the legacy ``tp_rank * shard_size`` formula.
         weight = ModelWeightParameter(
             data=torch.empty(
                 sum(output_partition_sizes),
@@ -204,6 +207,15 @@ class UnquantizedLinearMethod(LinearMethodBase):
             output_dim=0,
             weight_loader=weight_loader,
         )
+        if hasattr(layer, "partition_sizes"):
+            weight.tp_partition_sizes_output = layer.partition_sizes
+            # For column-parallel layers the input is replicated; for
+            # row-parallel the input is partitioned. The linear layer
+            # exposes ``partition_sizes`` for the *partitioned* dim, so we
+            # also forward it as the input dim when the input dim shape
+            # matches the partition sum (i.e. it really is row-parallel).
+            if layer.input_size_per_partition != layer.input_size:
+                weight.tp_partition_sizes_input = layer.partition_sizes
 
         layer.register_parameter("weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
@@ -360,6 +372,19 @@ class ReplicatedLinear(LinearBase):
             self.register_parameter("bias", None)
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
+        # If the weight on disk does not have a shape, give it one
+        # (such scales for AutoFp8).
+        # Special case for GGUF
+
+        is_gguf_weight = getattr(param, "is_gguf_weight", False)
+        is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
+        if is_gguf_weight_type:
+            param.weight_type = loaded_weight.item()
+
+        # Materialize GGUF UninitializedParameter
+        if is_gguf_weight and isinstance(param, UninitializedParameter):
+            param.materialize(loaded_weight.shape, dtype=loaded_weight.dtype)
+
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
 
@@ -435,12 +460,23 @@ class ColumnParallelLinear(LinearBase):
         self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
         self.tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
         self.input_size_per_partition = input_size
-        self.output_size_per_partition = divide(output_size, self.tp_size)
+        # Per-rank output partition sizes for heterogeneous TP: ``self.partition_sizes[i]``
+        # is the number of output columns assigned to TP rank ``i``. ``self.output_partition_sizes``
+        # is the *rank-local* view (what this rank sees); both views are needed by the
+        # weight loaders (cumulative offset) and the parameter creation (rank-local shape).
+        if disable_tp or self.tp_size == 1:
+            self.partition_sizes = [output_size]
+            self.output_size_per_partition = output_size
+        else:
+            self.partition_sizes = get_tp_partition_sizes_or_uniform(output_size)
+            self.output_size_per_partition = self.partition_sizes[self.tp_rank]
         self.output_partition_sizes = [self.output_size_per_partition]
-        # If QKV or MergedColumn, use output size of each partition.
+        # If QKV or MergedColumn, partition each segment independently and stack the
+        # rank-local slices into ``output_partition_sizes`` for ``create_weights``.
         if hasattr(self, "output_sizes"):
             self.output_partition_sizes = [
-                divide(output_size, self.tp_size) for output_size in self.output_sizes
+                get_tp_partition_sizes_or_uniform(s)[self.tp_rank]
+                for s in self.output_sizes
             ]
 
         super().__init__(
@@ -523,12 +559,28 @@ class ColumnParallelLinear(LinearBase):
         # no need to narrow
         is_sharded_weight = is_sharded_weight or use_bitsandbytes_4bit
 
+        # Special case for GGUF
+        is_gguf_weight = getattr(param, "is_gguf_weight", False)
+        is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
+        if is_gguf_weight_type:
+            param.weight_type = loaded_weight.item()
+
+        # Materialize GGUF UninitializedParameter
+        if is_gguf_weight and isinstance(param, UninitializedParameter):
+            final_shape = list(loaded_weight.shape)
+            if output_dim is not None:
+                # Use the rank-local slice (heterogeneous TP may have a
+                # different per-rank size than ``loaded_weight.size // tp_size``).
+                final_shape[output_dim] = self.output_size_per_partition
+            param.materialize(final_shape, dtype=loaded_weight.dtype)
+
         param_data = param.data
         if output_dim is not None and not is_sharded_weight:
             shard_size = param_data.shape[output_dim]
-            start_idx = self.tp_rank * shard_size
+            # Use the cumulative offset across per-rank partition sizes; for
+            # the uniform case this collapses to ``tp_rank * shard_size``.
+            start_idx = sum(self.partition_sizes[: self.tp_rank])
             loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
-
         # Special case for loading scales off disk, which often do not
         # have a shape (such as in the case of AutoFP8).
         if len(loaded_weight.shape) == 0:
@@ -555,8 +607,12 @@ class ColumnParallelLinear(LinearBase):
         output_parallel = self.quant_method.apply(self, input_, bias)
 
         if self.gather_output and self.tp_size > 1:
-            # All-gather across the partitions.
-            output = tensor_model_parallel_all_gather(output_parallel)
+            # All-gather across the partitions. Pass the per-rank partition
+            # sizes so the heterogeneous-TP pad-gather-slice path runs when
+            # the output dim is itself heterogeneously partitioned (e.g.
+            # LM head over vocab).
+            output = tensor_model_parallel_all_gather(
+            )
         else:
             output = output_parallel
 
@@ -618,7 +674,11 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         self.tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
         self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
 
-        assert all(output_size % self.tp_size == 0 for output_size in output_sizes)
+        # Note: no uniform-divisibility assertion here. With heterogeneous TP
+        # (--tensor-parallel-weights) each segment is partitioned by a
+        # per-rank weight list and individual segment sizes need not be
+        # divisible by tp_size; rank-local slices are constrained to be
+        # integers by the partition_sizes logic in ParallelConfig.
         super().__init__(
             input_size=input_size,
             output_size=sum(output_sizes),
@@ -666,6 +726,37 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         loaded_shard_id: tuple[int, ...] | int | None = None,
     ):
         self.validate_shard_id(loaded_shard_id)
+        # Special case for GGUF
+        # initialize GGUF param after we know the quantize type
+        is_gguf_weight = getattr(param, "is_gguf_weight", False)
+        is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
+        if isinstance(loaded_shard_id, tuple) and (
+            is_gguf_weight or is_gguf_weight_type
+        ):
+            raise NotImplementedError(
+                "Shard id with multiple indices is not supported for GGUF."
+            )
+        if is_gguf_weight_type:
+            if loaded_shard_id is not None:
+                param.data[loaded_shard_id].copy_(loaded_weight)
+                param.shard_weight_type[loaded_shard_id] = loaded_weight.item()
+            else:
+                param.shard_weight_type = {
+                    i: loaded_weight.item() for i, _ in enumerate(self.output_sizes)
+                }
+            return
+
+        if is_gguf_weight:
+            output_dim = getattr(param, "output_dim", None)
+            shard_size = loaded_weight.size(output_dim) // self.tp_size
+            start_idx = self.tp_rank * shard_size
+
+            if loaded_shard_id is not None:
+                loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+                param.shard_id.append(loaded_shard_id)
+                param.shard_id_map[loaded_shard_id] = len(param.data_container)
+                param.data_container.append(loaded_weight)
+                return
 
         param_data = param.data
         output_dim = getattr(param, "output_dim", None)
@@ -744,10 +835,26 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
         assert loaded_shard_id < len(self.output_sizes)
         if output_dim is not None:
-            shard_offset = sum(self.output_sizes[:loaded_shard_id])
-            shard_size = self.output_sizes[loaded_shard_id]
-            shard_offset //= self.tp_size
-            shard_size //= self.tp_size
+            # Heterogeneous TP path: each segment is partitioned independently
+            # using its own per-rank partition sizes (a single shared weight
+            # list applied proportionally to each segment). For the uniform
+            # case this collapses to ``sum(self.output_sizes[:i]) // tp_size``
+            # and ``self.output_sizes[i] // tp_size`` (matching the legacy
+            # behaviour bit-exactly).
+            seg_part_sizes = (
+                [self.output_sizes[loaded_shard_id]]
+                if self.tp_size == 1
+                else get_tp_partition_sizes_or_uniform(
+                    self.output_sizes[loaded_shard_id]
+                )
+            )
+            shard_size = seg_part_sizes[self.tp_rank]
+            # Offset within the rank-local param_data: concatenate the rank's
+            # slices of all preceding segments.
+            shard_offset = sum(
+                get_tp_partition_sizes_or_uniform(self.output_sizes[j])[self.tp_rank]
+                for j in range(loaded_shard_id)
+            )
 
             if isinstance(param, BlockQuantScaleParameter):
                 weight_block_size = getattr(self, "weight_block_size", None)
@@ -783,7 +890,13 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                     param, orig_offsets, str(loaded_shard_id)
                 )
             param_data = param_data.narrow(output_dim, shard_offset, shard_size)
-            start_idx = self.tp_rank * shard_size
+            # Offset within the *full* loaded weight: sum of preceding
+            # segments (in full-size units) + this rank's offset within the
+            # current segment (heterogeneous TP: ``sum(seg_part_sizes[:rank])``,
+            # collapses to ``tp_rank * shard_size`` when uniform).
+            start_idx = sum(self.output_sizes[:loaded_shard_id]) + sum(
+                seg_part_sizes[: self.tp_rank]
+            )
             if not is_sharded_weight:
                 loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
         # Special case for per-tensor scales in fused case.
@@ -891,10 +1004,20 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
         assert loaded_shard_id < len(self.output_sizes)
 
-        shard_offset = sum(self.output_sizes[:loaded_shard_id])
-        shard_size = self.output_sizes[loaded_shard_id]
-        shard_offset //= self.tp_size
-        shard_size //= self.tp_size
+        # Heterogeneous TP per-segment partition sizes (see ``weight_loader``
+        # for the rationale; uniform collapses to legacy ``//= tp_size``).
+        seg_part_sizes = (
+            [self.output_sizes[loaded_shard_id]]
+            if self.tp_size == 1
+            else get_tp_partition_sizes_or_uniform(self.output_sizes[loaded_shard_id])
+        )
+        shard_size = seg_part_sizes[self.tp_rank]
+        # Offset within the rank-local param_data (concatenation of per-rank
+        # slices of all preceding segments).
+        shard_offset = sum(
+            get_tp_partition_sizes_or_uniform(self.output_sizes[j])[self.tp_rank]
+            for j in range(loaded_shard_id)
+        )
 
         if isinstance(param, BlockQuantScaleParameter):
             weight_block_size = getattr(self, "weight_block_size", None)
@@ -902,11 +1025,19 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 weight_block_size, shard_size, shard_offset
             )
 
+        # Heterogeneous TP: ``loaded_weight_offset`` is the offset within the
+        # *full* loaded_weight for this rank's slice of this segment
+        # (sum of previous segments in full-size units, plus the cumulative
+        # sum of previous ranks in this segment's partition sizes).
+        loaded_weight_offset = sum(self.output_sizes[:loaded_shard_id]) + sum(
+            seg_part_sizes[: self.tp_rank]
+        )
         param.load_merged_column_weight(
             loaded_weight=loaded_weight,
             shard_id=loaded_shard_id,
             shard_offset=shard_offset,
             shard_size=shard_size,
+            loaded_weight_offset=loaded_weight_offset,
             tp_rank=self.tp_rank,
         )
 
@@ -971,6 +1102,13 @@ class QKVParallelLinear(ColumnParallelLinear):
         else:
             self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
             self.num_kv_head_replicas = 1
+        # Heterogeneous TP note: ``num_heads``/``num_kv_heads`` above stay
+        # uniform; the actual per-rank head count is derived from
+        # ``partition_sizes`` when --tensor-parallel-weights is in effect
+        # (see ``num_heads_per_rank`` below). The QKV weight matrix itself is
+        # partitioned by column size, so the parallel math is consistent as
+        # long as the chosen weights yield an integer number of heads per rank
+        # for both Q and KV (otherwise an explicit error is raised).
         input_size = self.hidden_size
         output_size = (
             self.num_heads * self.head_size
@@ -982,6 +1120,48 @@ class QKVParallelLinear(ColumnParallelLinear):
             self.num_kv_heads * self.head_size * tp_size,  # k_proj
             self.num_kv_heads * self.v_head_size * tp_size,  # v_proj
         ]
+
+        # Per-rank head counts under heterogeneous TP. When weights are unset
+        # (uniform TP) this collapses to ``num_heads // tp_size`` per rank.
+        if disable_tp or tp_size == 1:
+            self.num_heads_per_rank = [self.num_heads]
+            self.num_kv_heads_per_rank = [self.num_kv_heads]
+        else:
+            q_full = self.total_num_heads * self.head_size
+            kv_full = self.total_num_kv_heads * self.head_size
+            v_full = self.total_num_kv_heads * self.v_head_size
+            q_parts = get_tp_partition_sizes_or_uniform(q_full)
+            kv_parts = get_tp_partition_sizes_or_uniform(kv_full)
+            v_parts = get_tp_partition_sizes_or_uniform(v_full)
+            self.num_heads_per_rank = [p // self.head_size for p in q_parts]
+            self.num_kv_heads_per_rank = [p // self.head_size for p in kv_parts]
+            # QKV parallelism is fundamentally head-count based, so the
+            # per-rank partition must align to the head grid. We allow
+            # ``--tensor-parallel-weights`` only when every rank ends up
+            # with an integer number of heads for Q, K, and V; otherwise
+            # we fall back to uniform partitioning and warn so the user
+            # can either pick weights that divide cleanly or accept the
+            # uniform split.
+            if any(
+                p % self.head_size != 0
+                for p in (*q_parts, *kv_parts, *v_parts)
+            ):
+                from vllm.logger import init_logger
+
+                logger = init_logger(__name__)
+                logger.warning(
+                    "QKVParallelLinear: --tensor-parallel-weights %s does not "
+                    "produce an integer number of heads per rank "
+                    "(q_parts=%s, kv_parts=%s, v_parts=%s for head_size=%d). "
+                    "Falling back to uniform partitioning for this layer.",
+                    self.tp_rank,
+                    q_parts,
+                    kv_parts,
+                    v_parts,
+                    self.head_size,
+                )
+                self.num_heads_per_rank = [self.num_heads] * tp_size
+                self.num_kv_heads_per_rank = [self.num_kv_heads] * tp_size
 
         super().__init__(
             input_size=input_size,
@@ -1009,20 +1189,26 @@ class QKVParallelLinear(ColumnParallelLinear):
         raise ValueError("This line should not be reached")
 
     def _get_shard_offset_mapping(self, loaded_shard_id: str):
+        # Heterogeneous TP: use the rank's own head count so the loaded
+        # shard slice lines up with the rank-local param_data view.
+        local_num_heads = self.num_heads_per_rank[self.tp_rank]
+        local_num_kv_heads = self.num_kv_heads_per_rank[self.tp_rank]
         shard_offset_mapping = {
             "q": 0,
-            "k": self.num_heads * self.head_size,
-            "v": (self.num_heads + self.num_kv_heads) * self.head_size,
-            "total": (self.num_heads + self.num_kv_heads) * self.head_size
-            + self.num_kv_heads * self.v_head_size,
+            "k": local_num_heads * self.head_size,
+            "v": (local_num_heads + local_num_kv_heads) * self.head_size,
+            "total": (local_num_heads + local_num_kv_heads) * self.head_size
+            + local_num_kv_heads * self.v_head_size,
         }
         return shard_offset_mapping.get(loaded_shard_id)
 
     def _get_shard_size_mapping(self, loaded_shard_id: str):
+        local_num_heads = self.num_heads_per_rank[self.tp_rank]
+        local_num_kv_heads = self.num_kv_heads_per_rank[self.tp_rank]
         shard_size_mapping = {
-            "q": self.num_heads * self.head_size,
-            "k": self.num_kv_heads * self.head_size,
-            "v": self.num_kv_heads * self.v_head_size,
+            "q": local_num_heads * self.head_size,
+            "k": local_num_kv_heads * self.head_size,
+            "v": local_num_kv_heads * self.v_head_size,
         }
         return shard_size_mapping.get(loaded_shard_id)
 
@@ -1105,7 +1291,6 @@ class QKVParallelLinear(ColumnParallelLinear):
 
         shard_offset = self._get_shard_offset_mapping(loaded_shard_id)
         shard_size = self._get_shard_size_mapping(loaded_shard_id)
-        assert shard_offset is not None and shard_size is not None
 
         if isinstance(param, BlockQuantScaleParameter):
             weight_block_size = getattr(self, "weight_block_size", None)
@@ -1113,15 +1298,37 @@ class QKVParallelLinear(ColumnParallelLinear):
                 weight_block_size, shard_size, shard_offset
             )
 
+        # Heterogeneous TP: the offset within the full loaded_weight for this
+        # rank's slice of the current QKV segment (see the v1 weight_loader's
+        # mirroring block for the rationale).
+        if loaded_shard_id == "q":
+            q_parts = (
+                [self.num_heads_per_rank[0] * self.head_size]
+                if self.tp_size == 1
+                else get_tp_partition_sizes_or_uniform(self.total_num_heads * self.head_size)
+            )
+            loaded_weight_offset = sum(q_parts[: self.tp_rank])
+        else:
+            if self.num_kv_head_replicas > 1:
+                loaded_weight_offset = (
+                    (self.tp_rank // self.num_kv_head_replicas)
+                    * self.num_kv_heads_per_rank[0]
+                    * self.head_size
+                )
+            else:
+                loaded_weight_offset = (
+                    sum(self.num_kv_heads_per_rank[: self.tp_rank]) * self.head_size
+                )
+
         param.load_qkv_weight(
             loaded_weight=loaded_weight,
             num_heads=self.num_kv_head_replicas,
             shard_id=loaded_shard_id,
             shard_offset=shard_offset,
             shard_size=shard_size,
+            loaded_weight_offset=loaded_weight_offset,
             tp_rank=self.tp_rank,
         )
-
     def weight_loader(
         self,
         param: Parameter,
@@ -1129,6 +1336,30 @@ class QKVParallelLinear(ColumnParallelLinear):
         loaded_shard_id: str | None = None,
     ):
         self.validate_shard_id(loaded_shard_id)
+        # Special case for GGUF
+        # initialize GGUF param after we know the quantize type
+        is_gguf_weight = getattr(param, "is_gguf_weight", False)
+        is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
+        if is_gguf_weight_type:
+            idx_map = {"q": 0, "k": 1, "v": 2}
+            if loaded_shard_id is not None:
+                param.data[idx_map[loaded_shard_id]].copy_(loaded_weight)
+                param.shard_weight_type[loaded_shard_id] = loaded_weight.item()
+            else:
+                param.shard_weight_type = {k: loaded_weight.item() for k in idx_map}
+            return
+
+        if is_gguf_weight:
+            output_dim = getattr(param, "output_dim", None)
+            shard_size = loaded_weight.size(output_dim) // self.tp_size
+            start_idx = self.tp_rank * shard_size
+
+            if loaded_shard_id is not None:
+                loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+                param.shard_id.append(loaded_shard_id)
+                param.shard_id_map[loaded_shard_id] = len(param.data_container)
+                param.data_container.append(loaded_weight)
+                return
 
         param_data = param.data
         output_dim = getattr(param, "output_dim", None)
@@ -1214,20 +1445,24 @@ class QKVParallelLinear(ColumnParallelLinear):
                 )
                 self.weight_loader(param, loaded_weight_shard, shard_id)
             return
-
-        assert loaded_shard_id in ["q", "k", "v"]
-
         # If output dim is defined, use the default loading process.
         if output_dim is not None:
+            # Heterogeneous TP: use the rank's own head counts so the loaded
+            # shard slice lines up with both the rank-local param_data view
+            # (already partitioned when the parameter was created) and the
+            # full on-disk tensor. Under uniform TP the per-rank values are
+            # all equal and this collapses to the legacy math.
+            local_num_heads = self.num_heads_per_rank[self.tp_rank]
+            local_num_kv_heads = self.num_kv_heads_per_rank[self.tp_rank]
             if loaded_shard_id == "q":
                 shard_offset = 0
-                shard_size = self.num_heads * self.head_size
+                shard_size = local_num_heads * self.head_size
             elif loaded_shard_id == "k":
-                shard_offset = self.num_heads * self.head_size
-                shard_size = self.num_kv_heads * self.head_size
+                shard_offset = local_num_heads * self.head_size
+                shard_size = local_num_kv_heads * self.head_size
             elif loaded_shard_id == "v":
-                shard_offset = (self.num_heads + self.num_kv_heads) * self.head_size
-                shard_size = self.num_kv_heads * self.v_head_size
+                shard_offset = (local_num_heads + local_num_kv_heads) * self.head_size
+                shard_size = local_num_kv_heads * self.v_head_size
 
             if isinstance(param, BlockQuantScaleParameter):
                 weight_block_size = getattr(self, "weight_block_size", None)
@@ -1276,12 +1511,48 @@ class QKVParallelLinear(ColumnParallelLinear):
                 )
 
             param_data = param_data.narrow(output_dim, shard_offset, shard_size)
+            # start_idx is the offset within the *full* loaded weight for this
+            # rank's slice of the current segment. Q is always partitioned by
+            # column. K/V is partitioned when ``tp_size < total_num_kv_heads``
+            # (``num_kv_head_replicas == 1``) and replicated otherwise (each KV
+            # head is shared by ``num_kv_head_replicas`` consecutive ranks).
+            # The cumulative offset collapses to the legacy
+            # ``shard_rank * shard_size`` under the uniform-TP path.
             if loaded_shard_id == "q":
-                shard_rank = self.tp_rank
+                # Cumulative offset across previous ranks in Q's partition.
+                q_parts = (
+                    [self.num_heads_per_rank[0] * self.head_size]
+                    if self.tp_size == 1
+                    else get_tp_partition_sizes_or_uniform(
+                        self.total_num_heads * self.head_size
+                    )
+                )
+                start_idx = sum(q_parts[: self.tp_rank])
             else:
-                shard_rank = self.tp_rank // self.num_kv_head_replicas
-            start_idx = shard_rank * shard_size
-
+                # K/V: each rank owns ``num_kv_heads_per_rank[rank]`` heads, and
+                # replica groups of size ``num_kv_head_replicas`` share the
+                # same heads.
+                # - Partitioned (``num_kv_head_replicas == 1``): the offset is
+                #   the cumulative head count before this rank (each rank has
+                #   a unique chunk of the KV segment).
+                # - Replicated (``num_kv_head_replicas > 1``): the offset is
+                #   the replica-group index times one head's worth (each
+                #   ``num_kv_head_replicas`` consecutive ranks share the same
+                #   head).
+                # Under uniform TP this collapses to the legacy
+                # ``(tp_rank // num_kv_head_replicas) * num_kv_heads *
+                # head_size`` formula.
+                if self.num_kv_head_replicas > 1:
+                    start_idx = (
+                        (self.tp_rank // self.num_kv_head_replicas)
+                        * self.num_kv_heads_per_rank[0]
+                        * self.head_size
+                    )
+                else:
+                    start_idx = (
+                        sum(self.num_kv_heads_per_rank[: self.tp_rank])
+                        * self.head_size
+                    )
             if not is_sharded_weight:
                 loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
 
@@ -1299,191 +1570,6 @@ class QKVParallelLinear(ColumnParallelLinear):
                     "for all partitions."
                 )
 
-        assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
-
-
-class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
-    """QKV projection fused with a lightning-indexer's index_q/index_k.
-
-    NOTE: MiniMax-M3-specific. This is tailored to the M3 sparse-attention
-    layers (it assumes the indexer's head count equals the KV head count and
-    shares the main head_dim); it is not a general-purpose linear layer. It
-    lives here only to sit alongside QKVParallelLinear, whose sharding /
-    weight-loading machinery it reuses.
-
-    A single column-parallel GEMM emits, per rank::
-
-        [q | k | v | index_q | index_k]
-
-    ``index_q`` must have the same head count as the KV heads
-    (``total_num_index_heads == total_num_kv_heads``) and ``index_head_size ==
-    head_size``, so it shards exactly like K/V -- including the KV-head
-    *replication* path when ``tp_size > total_num_kv_heads`` (this is what makes
-    a TP size greater than the KV-head count work). ``index_k`` is a single
-    shared head, replicated to every rank.
-    """
-
-    def __init__(
-        self,
-        hidden_size: int,
-        head_size: int,
-        total_num_heads: int,
-        total_num_kv_heads: int,
-        total_num_index_heads: int,
-        index_head_size: int,
-        bias: bool = False,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-    ) -> None:
-        # index_q rides the KV-head sharding/replication path, so its head count
-        # must match the KV heads.
-        assert total_num_index_heads == total_num_kv_heads, (
-            "MinimaxM3QKVParallelLinearWithIndexer requires "
-            "total_num_index_heads == total_num_kv_heads"
-        )
-        self.hidden_size = hidden_size
-        self.head_size = head_size
-        self.v_head_size = head_size
-        self.total_num_heads = total_num_heads
-        self.total_num_kv_heads = total_num_kv_heads
-        self.total_num_index_heads = total_num_index_heads
-        self.index_head_size = index_head_size
-
-        tp_size = get_tensor_model_parallel_world_size()
-        self.num_heads = divide(self.total_num_heads, tp_size)
-        if tp_size >= self.total_num_kv_heads:
-            self.num_kv_heads = 1
-            self.num_kv_head_replicas = divide(tp_size, self.total_num_kv_heads)
-        else:
-            self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
-            self.num_kv_head_replicas = 1
-        # index_q shards identically to the KV heads.
-        self.num_index_heads = self.num_kv_heads
-
-        # Global per-group sizes (replicated groups counted x tp_size, matching
-        # the QKVParallelLinear convention). index_k is a single replicated head.
-        q = self.num_heads * self.head_size
-        kv = self.num_kv_heads * self.head_size
-        iq = self.num_index_heads * self.index_head_size
-        ik = self.index_head_size
-        self.output_sizes = [
-            q * tp_size,  # q
-            kv * tp_size,  # k
-            kv * tp_size,  # v
-            iq * tp_size,  # index_q
-            ik * tp_size,  # index_k (replicated)
-        ]
-
-        # Skip QKVParallelLinear.__init__ (3-group layout); build the 5-group
-        # column-parallel weight directly.
-        ColumnParallelLinear.__init__(
-            self,
-            input_size=self.hidden_size,
-            output_size=sum(self.output_sizes),
-            bias=bias,
-            gather_output=False,
-            quant_config=quant_config,
-            prefix=prefix,
-        )
-
-    def validate_shard_id(self, loaded_shard_id: str | None) -> None:
-        if loaded_shard_id is None:
-            return
-        if loaded_shard_id not in ("q", "k", "v", "index_q", "index_k"):
-            raise ValueError(
-                "Shard id for MinimaxM3QKVParallelLinearWithIndexer must be one of "
-                "'q', 'k', 'v', 'index_q', 'index_k'; got "
-                f"{loaded_shard_id}."
-            )
-
-    def _get_shard_offset_mapping(self, loaded_shard_id: str) -> int | None:
-        h = self.head_size
-        nq, nkv, nidx = self.num_heads, self.num_kv_heads, self.num_index_heads
-        return {
-            "q": 0,
-            "k": nq * h,
-            "v": (nq + nkv) * h,
-            "index_q": (nq + 2 * nkv) * h,
-            "index_k": (nq + 2 * nkv + nidx) * h,
-        }.get(loaded_shard_id)
-
-    def _get_shard_size_mapping(self, loaded_shard_id: str) -> int | None:
-        h = self.head_size
-        return {
-            "q": self.num_heads * h,
-            "k": self.num_kv_heads * h,
-            "v": self.num_kv_heads * h,
-            "index_q": self.num_index_heads * h,
-            "index_k": self.index_head_size,
-        }.get(loaded_shard_id)
-
-    def weight_loader_v2(
-        self,
-        param: BasevLLMParameter,
-        loaded_weight: torch.Tensor,
-        loaded_shard_id: str | None = None,
-    ) -> None:
-        self.validate_shard_id(loaded_shard_id)
-        # Index checkpoints are never pre-fused on disk; a shard id is always given.
-        assert loaded_shard_id in ("q", "k", "v", "index_q", "index_k")
-
-        shard_offset = self._get_shard_offset_mapping(loaded_shard_id)
-        shard_size = self._get_shard_size_mapping(loaded_shard_id)
-        assert shard_offset is not None and shard_size is not None
-        if isinstance(param, BlockQuantScaleParameter):
-            weight_block_size = getattr(self, "weight_block_size", None)
-            shard_size, shard_offset = adjust_block_scale_shard(
-                weight_block_size, shard_size, shard_offset
-            )
-
-        # index_k is fully replicated: num_heads == tp_size makes
-        # load_qkv_weight pick shard_id_int == 0 on every rank. q/k/v/index_q ride
-        # the KV-head replication factor.
-        num_heads = (
-            self.tp_size if loaded_shard_id == "index_k" else self.num_kv_head_replicas
-        )
-        param.load_qkv_weight(
-            loaded_weight=loaded_weight,
-            num_heads=num_heads,
-            shard_id=loaded_shard_id,
-            shard_offset=shard_offset,
-            shard_size=shard_size,
-            tp_rank=self.tp_rank,
-        )
-
-    def weight_loader(
-        self,
-        param: Parameter,
-        loaded_weight: torch.Tensor,
-        loaded_shard_id: str | None = None,
-    ) -> None:
-        # Unquantized (bf16) path. MXFP8 checkpoints use weight_loader_v2; this
-        # keeps an unquantized load correct too.
-        self.validate_shard_id(loaded_shard_id)
-        assert loaded_shard_id in ("q", "k", "v", "index_q", "index_k")
-        output_dim = getattr(param, "output_dim", None)
-        assert output_dim is not None
-
-        shard_offset = self._get_shard_offset_mapping(loaded_shard_id)
-        shard_size = self._get_shard_size_mapping(loaded_shard_id)
-        assert shard_offset is not None and shard_size is not None
-        if isinstance(param, BlockQuantScaleParameter):
-            weight_block_size = getattr(self, "weight_block_size", None)
-            shard_size, shard_offset = adjust_block_scale_shard(
-                weight_block_size, shard_size, shard_offset
-            )
-
-        param_data = param.data.narrow(output_dim, shard_offset, shard_size)
-        if loaded_shard_id == "q":
-            shard_rank = self.tp_rank
-        elif loaded_shard_id == "index_k":
-            shard_rank = 0  # replicated to every rank
-        else:
-            shard_rank = self.tp_rank // self.num_kv_head_replicas
-        loaded_weight = loaded_weight.narrow(
-            output_dim, shard_rank * shard_size, shard_size
-        )
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
 
@@ -1543,7 +1629,14 @@ class RowParallelLinear(LinearBase):
         # Divide the weight matrix along the first dimension.
         self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
         self.tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
-        self.input_size_per_partition = divide(input_size, self.tp_size)
+        # Per-rank input partition sizes for heterogeneous TP (see the
+        # ``ColumnParallelLinear`` ``__init__`` for the rationale).
+        if disable_tp or self.tp_size == 1:
+            self.partition_sizes = [input_size]
+            self.input_size_per_partition = input_size
+        else:
+            self.partition_sizes = get_tp_partition_sizes_or_uniform(input_size)
+            self.input_size_per_partition = self.partition_sizes[self.tp_rank]
         self.output_size_per_partition = output_size
         self.output_partition_sizes = [output_size]
 
@@ -1602,12 +1695,26 @@ class RowParallelLinear(LinearBase):
         # no need to narrow
         is_sharded_weight = is_sharded_weight or use_bitsandbytes_4bit
 
+        # Special case for GGUF
+        is_gguf_weight = getattr(param, "is_gguf_weight", False)
+        is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
+        if is_gguf_weight_type:
+            param.weight_type = loaded_weight.item()
+
+        # Materialize GGUF UninitializedParameter
+        if is_gguf_weight and isinstance(param, UninitializedParameter):
+            weight_shape = list(loaded_weight.shape)
+            if input_dim:
+                weight_shape[input_dim] = self.input_size_per_partition
+            param.materialize(tuple(weight_shape), dtype=loaded_weight.dtype)
+
         param_data = param.data
         if input_dim is not None and not is_sharded_weight:
             shard_size = param_data.shape[input_dim]
-            start_idx = self.tp_rank * shard_size
+            # Use the cumulative offset across per-rank partition sizes; for
+            # the uniform case this collapses to ``tp_rank * shard_size``.
+            start_idx = sum(self.partition_sizes[: self.tp_rank])
             loaded_weight = loaded_weight.narrow(input_dim, start_idx, shard_size)
-
         # Special case for loading scales off disk, which often do not
         # have a shape (such as in the case of AutoFP8).
         if len(loaded_weight.shape) == 0:

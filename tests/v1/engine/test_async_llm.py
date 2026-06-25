@@ -512,11 +512,12 @@ async def test_header_dp_rank_argument():
         )
 
         # Create render serving instance (required by OpenAIServingChat)
-        from vllm.renderers.online_renderer import OnlineRenderer
+        from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 
-        online_renderer = OnlineRenderer(
+        serving_render = OpenAIServingRender(
             model_config=engine.model_config,
             renderer=engine.renderer,
+            model_registry=models.registry,
             request_logger=None,
             chat_template=None,
             chat_template_content_format="auto",
@@ -527,7 +528,7 @@ async def test_header_dp_rank_argument():
             engine_client=engine,
             models=models,
             response_role="assistant",
-            online_renderer=online_renderer,
+            openai_serving_render=serving_render,
             chat_template=None,
             chat_template_content_format="auto",
             request_logger=None,

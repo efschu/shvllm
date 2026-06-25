@@ -327,7 +327,6 @@ pub async fn connect_handshake(
 pub async fn connect_bootstrapped(
     input_address: &str,
     output_address: &str,
-    engine_start_index: u32,
     engine_count: usize,
     ready_timeout: Duration,
 ) -> Result<ConnectedTransport> {
@@ -343,8 +342,8 @@ pub async fn connect_bootstrapped(
 
     let engines = wait_for_input_registrations(
         &mut input_socket,
-        (0..engine_count)
-            .map(|offset| EngineId::from_engine_index(engine_start_index + offset as u32)),
+        // TODO: follow start rank
+        (0..engine_count).map(|index| EngineId::from((index as u16).to_le_bytes().to_vec())),
         ready_timeout,
     )
     .await?;

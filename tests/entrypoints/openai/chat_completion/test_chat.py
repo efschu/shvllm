@@ -824,10 +824,7 @@ async def test_invocations(server: RemoteOpenAIServer, client: openai.AsyncOpenA
     chat_output = chat_response.json()
     invocation_output = invocation_response.json()
 
-    extra_keys = invocation_output.keys() - chat_output.keys()
-    missing_keys = chat_output.keys() - invocation_output.keys()
-    assert missing_keys == set()
-    assert extra_keys <= {"moderation"}
+    assert chat_output.keys() == invocation_output.keys()
     assert chat_output["choices"] == invocation_output["choices"]
 
 

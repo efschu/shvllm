@@ -8,6 +8,7 @@ import threading
 from typing import TYPE_CHECKING
 
 import torch
+from torch.distributed import ProcessGroup
 
 from vllm.distributed.parallel_state import get_eplb_group
 from vllm.logger import init_logger
@@ -25,7 +26,8 @@ def start_async_worker(
     state: "EplbState",
     is_profile: bool = False,
 ) -> threading.Thread:
-    rank = get_eplb_group().device_group.rank()
+    eplb_group = get_eplb_group().device_group
+    rank = eplb_group.rank()
     device_index = state.cuda_device_index
     assert state.is_async
 
@@ -36,6 +38,7 @@ def start_async_worker(
         try:
             transfer_run_periodically(
                 state=state,
+                eplb_group=eplb_group,
                 cuda_stream=cuda_stream,
                 is_profile=is_profile,
             )
@@ -75,15 +78,13 @@ def run_rebalance_experts(
 
 def transfer_run_periodically(
     state: "EplbState",
+    eplb_group: ProcessGroup,
     cuda_stream: torch.cuda.Stream,
     is_profile: bool = False,
 ) -> None:
     while True:
         state.rearrange_event.wait(stream=cuda_stream)
-
-        eplb_group = get_eplb_group().device_group
-        eplb_cpu_group = get_eplb_group().cpu_group
-        ep_rank = eplb_group.rank()
+        logger.info("async worker woke up for EPLB transfer")
 
         assert state.is_async
         for model_state in state.model_states.values():
@@ -100,32 +101,16 @@ def transfer_run_periodically(
             new_physical_to_logical_map = run_rebalance_experts(
                 model_state, state, physical_to_logical_map_cpu, cuda_stream
             )
+            logger.info(
+                "Async worker computed new indices for model %s",
+                model_state.model_name,
+            )
 
             # Execute one EPLB layer transfer per model forward pass. Each iteration
             # of this loop will copy the new set of expert weights into
             # model_state.expert_buffer, which will be consumed by the main thread in
-            # move_to_workspace.
-            # We sync the rebalanced flag across ranks before each iteration so
-            # all ranks make a coordinated decision to continue or stop.
-            while layer_idx < num_layers:
-                flag = torch.tensor(
-                    [int(model_state.rebalanced)],
-                    dtype=torch.int32,
-                    device="cpu",
-                )
-                torch.distributed.all_reduce(flag, group=eplb_cpu_group)
-                if int(flag.item()) != eplb_cpu_group.size():
-                    logger.warning(
-                        "async worker (rank=%d): layer %d coordinated stop "
-                        "(flag_sum=%d, group_size=%d)",
-                        ep_rank,
-                        layer_idx,
-                        int(flag.item()),
-                        eplb_cpu_group.size(),
-                    )
-                    model_state.rebalanced = False
-                    break
-
+            # move_to_workspace
+            while model_state.rebalanced and layer_idx < num_layers:
                 transfer_metadata = transfer_layer(
                     old_layer_indices=physical_to_logical_map_cpu[layer_idx],
                     new_layer_indices=new_physical_to_logical_map[layer_idx],
@@ -158,5 +143,6 @@ def transfer_run_periodically(
                 # finish copying model_state.expert_buffer into
                 # model_state.model.expert_weights[layer_idx]
                 consumed_event.wait(stream=cuda_stream)
+                logger.debug("Layer %d transfer complete", layer_idx)
                 assert model_state.pending_result is None
                 layer_idx += 1

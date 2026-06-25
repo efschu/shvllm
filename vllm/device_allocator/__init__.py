@@ -3,15 +3,14 @@
 
 import dataclasses
 from contextlib import AbstractContextManager
-from typing import Protocol, TypeAlias
+from typing import Protocol
 
 import torch
 
 from vllm.platforms import current_platform
 
 # py_device, py_size_or_aligned_size, py_ptr, py_handle
-# py_handle has type list[int] on ROCm and int otherwise
-HandleType: TypeAlias = tuple[int, int, int, list[int] | int]
+HandleType = tuple[int, int, int, int]
 
 
 @dataclasses.dataclass
@@ -19,7 +18,6 @@ class AllocationData:
     handle: HandleType
     tag: str
     cpu_backup_tensor: torch.Tensor | None = None
-    is_asleep: bool = False
 
 
 class MemAllocator(Protocol):

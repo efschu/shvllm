@@ -317,7 +317,7 @@ class SweepStartupArgs:
         )
 
     @classmethod
-    def add_cli_args(cls, parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
+    def add_cli_args(cls, parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         parser.add_argument(
             "--startup-cmd",
             type=str,
@@ -438,6 +438,6 @@ def main(args: argparse.Namespace):
 
 
 if __name__ == "__main__":
-    parser = FlexibleArgumentParser(description=SweepStartupArgs.parser_help)
+    parser = argparse.ArgumentParser(description=SweepStartupArgs.parser_help)
     SweepStartupArgs.add_cli_args(parser)
     main(parser.parse_args())

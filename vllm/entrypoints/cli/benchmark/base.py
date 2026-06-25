@@ -3,7 +3,6 @@
 import argparse
 
 from vllm.entrypoints.cli.types import CLISubcommand
-from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 
 class BenchmarkSubcommandBase(CLISubcommand):
@@ -12,7 +11,7 @@ class BenchmarkSubcommandBase(CLISubcommand):
     help: str
 
     @classmethod
-    def add_cli_args(cls, parser: FlexibleArgumentParser) -> None:
+    def add_cli_args(cls, parser: argparse.ArgumentParser) -> None:
         """Add the CLI arguments to the parser."""
         raise NotImplementedError
 

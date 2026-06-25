@@ -482,11 +482,10 @@ def _init_lmcache_engine(
     )
 
     # Change current device.
-    from vllm.distributed.parallel_state import get_world_group
-
-    device_index = get_world_group().device_index
-    torch.accelerator.set_device_index(device_index)
-    device = torch.device(f"cuda:{device_index}")
+    num_gpus = torch.accelerator.device_count()
+    local_rank = parallel_config.rank % num_gpus
+    torch.accelerator.set_device_index(local_rank)
+    device = torch.device(f"cuda:{local_rank}")
     metadata = LMCacheEngineMetadata(
         model_config.model,
         parallel_config.world_size,

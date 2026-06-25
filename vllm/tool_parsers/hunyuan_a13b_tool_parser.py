@@ -144,7 +144,7 @@ class HunyuanA13BToolParser(ToolParser):
                     function=FunctionCall(
                         name=call["name"],
                         arguments=(
-                            json.dumps(call["arguments"], ensure_ascii=False)
+                            json.dumps(call["arguments"])
                             if isinstance(call["arguments"], dict)
                             else call["arguments"]
                         ),

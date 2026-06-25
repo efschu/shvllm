@@ -121,6 +121,15 @@ class ParallelConfig:
     """Number of pipeline parallel groups."""
     tensor_parallel_size: int = Field(default=1, ge=1)
     """Number of tensor parallel groups."""
+    tensor_parallel_weights: list[float] | None = None
+    """Optional per-rank relative compute weights for heterogeneous tensor
+    parallelism. Must have exactly ``tensor_parallel_size`` entries, all
+    positive. The list is normalized to sum to 1 and used to derive each
+    rank's column/row partition sizes (any leftover columns/rows after the
+    base split are assigned to rank 0). When unset (default), each rank
+    receives an equal share, matching pre-heterogeneous-TP behaviour.
+    Example: ``[2, 1, 1]`` with TP=3 gives rank 0 a 50% share and ranks 1/2
+    a 25% share each."""
     prefill_context_parallel_size: int = Field(default=1, ge=1)
     """Number of prefill context parallel groups."""
     data_parallel_size: int = Field(default=1, ge=1)
@@ -302,14 +311,6 @@ class ParallelConfig:
     Each entry must use `numactl --physcpubind` CPU-list syntax, for example
     `"0-3"` or `"0,2,4-7"`.
     """
-    assigned_physical_gpu_ids: list[int] | None = None
-    """Mapping from vLLM-local logical GPU IDs to physical GPU IDs.
-
-    For example, ``[2, 3]`` means logical GPU 0 maps to physical GPU 2,
-    and logical GPU 1 maps to physical GPU 3. Physical IDs are used only
-    at platform/topology boundaries such as NVML, NIC affinity, P2P
-    checks, and final CUDA device selection when needed. When None,
-    logical IDs map to visible device IDs in order."""
 
     distributed_timeout_seconds: int | None = None
     """Timeout in seconds for distributed operations (e.g., init_process_group).
@@ -439,6 +440,18 @@ class ParallelConfig:
 
     @model_validator(mode="after")
     def _validate_parallel_config(self) -> Self:
+        if self.tensor_parallel_weights is not None:
+            weights = self.tensor_parallel_weights
+            if len(weights) != self.tensor_parallel_size:
+                raise ValueError(
+                    "tensor_parallel_weights must have exactly "
+                    f"{self.tensor_parallel_size} entries (one per TP rank), "
+                    f"got {len(weights)} entries: {weights}"
+                )
+            if any(w <= 0 for w in weights):
+                raise ValueError(
+                    f"all tensor_parallel_weights must be > 0, got {weights}"
+                )
         if self._api_process_rank >= self._api_process_count:
             raise ValueError(
                 "Invalid value of `_api_process_rank`. "
@@ -518,6 +531,51 @@ class ParallelConfig:
         """world_size_across_dp is TPxPPxDP, it is the size of the world
         including data parallelism."""
         return self.world_size * self.data_parallel_size
+
+    def tp_partition_sizes(self, total_size: int) -> list[int]:
+        """Per-rank TP column/row partition sizes for ``total_size`` columns
+        (ColumnParallel) or rows (RowParallel).
+
+        If ``tensor_parallel_weights`` is set, weights are normalized to sum
+        to 1 and used to split ``total_size`` proportionally across ranks,
+        with any leftover columns/rows assigned to rank 0 so the sum equals
+        ``total_size`` exactly. Otherwise the split is uniform
+        ``[total_size // tp_size] * tp_size`` (with the same leftover-to-rank-0
+        rounding for non-divisible totals), preserving pre-heterogeneous-TP
+        behaviour.
+        """
+        tp_size = self.tensor_parallel_size
+        if tp_size == 1:
+            return [total_size]
+        if self.tensor_parallel_weights is None:
+            base, rem = divmod(total_size, tp_size)
+            return [base + (1 if i < rem else 0) for i in range(tp_size)]
+        weights = [float(w) for w in self.tensor_parallel_weights]
+        total_w = sum(weights)
+        if total_w <= 0:
+            raise ValueError(
+                "tensor_parallel_weights must have a positive sum, got "
+                f"{self.tensor_parallel_weights}"
+            )
+        normalized = [w / total_w for w in weights]
+        # Initial floor split; leftover columns/rows are assigned in order to
+        # ranks with the largest fractional remainders, with rank 0 acting as
+        # the tie-breaker (and absorbing the trailing leftovers last) so the
+        # cumulative behaviour at uniform weights is identical to the
+        # pre-heterogeneous-TP path.
+        base_shares = [int(total_size * n) for n in normalized]
+        leftover = total_size - sum(base_shares)
+        if leftover:
+            # Distribute leftover by descending fractional remainder, breaking
+            # ties towards rank 0 so that a uniform weight list collapses to
+            # the same uniform split as the legacy path.
+            order = sorted(
+                range(tp_size),
+                key=lambda i: (-((total_size * normalized[i]) % 1), i),
+            )
+            for i in order[:leftover]:
+                base_shares[i] += 1
+        return base_shares
 
     @property
     def use_ubatching(self) -> bool:
@@ -780,7 +838,6 @@ class ParallelConfig:
             "numa_bind",
             "numa_bind_nodes",
             "numa_bind_cpus",
-            "assigned_physical_gpu_ids",
         }
 
         from vllm.config.utils import get_hash_factors, hash_factors
@@ -803,6 +860,13 @@ class ParallelConfig:
         if self.enable_elastic_ep:
             if not self.enable_eplb:
                 raise ValueError("Elastic EP is only supported with enable_eplb=True.")
+            if self.eplb_config.use_async:
+                raise ValueError(
+                    "Elastic EP requires the pynccl communicator, which is "
+                    "incompatible with async EPLB due to NCCL multi-stream "
+                    "conflicts. Disable async EPLB (eplb_config.use_async=False) "
+                    "to use elastic EP."
+                )
             if self.pipeline_parallel_size > 1:
                 raise ValueError(
                     "Elastic EP is not supported with pipeline parallelism "
@@ -814,15 +878,6 @@ class ParallelConfig:
                     "or data_parallel_hybrid_lb. Elastic EP relies on a single API "
                     "server and core client to coordinate scale up/down."
                 )
-            if self.eplb_config.use_async:
-                from vllm.distributed.nixl_utils import is_nixl_available
-
-                if not is_nixl_available():
-                    raise ValueError(
-                        "Elastic EP with async EPLB requires the NIXL "
-                        "package. Either install NIXL or set "
-                        "--eplb-config.use_async=false."
-                    )
 
         if self.data_parallel_size > 1 or self.data_parallel_size_local == 0:
             # Data parallel was specified in the engine args.
@@ -931,21 +986,23 @@ class ParallelConfig:
             )
 
         if self.enable_eplb and self.eplb_config.communicator is None:
-            # Prefer NIXL when available: zero-copy RDMA reads, compatible
-            # with both async EPLB and elastic EP (deferred remote setup).
-            # Fallbacks: pynccl for elastic EP (stateless groups need it),
-            # torch_gloo for static EP.  torch_nccl is avoided because NCCL
-            # is incompatible with async EPLB (multi-stream conflicts) and
-            # batched isend/irecv hangs under high load.
-            # See https://github.com/pytorch/pytorch/issues/174288
-            from vllm.distributed.nixl_utils import is_nixl_available
-
-            if is_nixl_available():
-                self.eplb_config.communicator = "nixl"
-            elif self.enable_elastic_ep:
+            if self.enable_elastic_ep:
+                # Elastic EP requires stateless mode
+                # (torch.distributed.batch_isend_irecv doesn't
+                # support stateless mode), so we use PyNCCL backend
                 self.eplb_config.communicator = "pynccl"
             else:
-                self.eplb_config.communicator = "torch_gloo"
+                # Avoid torch_nccl: NCCL is fundamentally incompatible
+                # with async EPLB due to multi-stream conflicts, and
+                # batched isend/irecv hangs under high load.
+                # See https://github.com/pytorch/pytorch/issues/174288
+                # Prefer nixl when available; fall back to torch_gloo.
+                from vllm.distributed.nixl_utils import is_nixl_available
+
+                if is_nixl_available():
+                    self.eplb_config.communicator = "nixl"
+                else:
+                    self.eplb_config.communicator = "torch_gloo"
 
     @property
     def use_ray(self) -> bool:

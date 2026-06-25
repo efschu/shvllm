@@ -382,16 +382,12 @@ impl ChatOptions {
 }
 
 /// Tool-choice semantics supported by `vllm-chat`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChatToolChoice {
+    Auto,
     #[default]
     None,
-    Auto,
-    Required,
-    Function {
-        name: String,
-    },
 }
 
 /// One chat request ready to be rendered into a prompt and lowered into a
@@ -410,10 +406,6 @@ pub struct ChatRequest {
     pub tools: Vec<ChatTool>,
     /// Tool-choice behavior for this request.
     pub tool_choice: ChatToolChoice,
-    /// Whether the model may return more than one tool call per response.
-    ///
-    /// When `false`, only the first parsed tool call is surfaced northbound.
-    pub parallel_tool_calls: bool,
     /// Text decode options for incremental detokenization.
     pub decode_options: TextDecodeOptions,
     /// Whether to emit intermediate northbound content deltas before the
@@ -450,7 +442,6 @@ impl ChatRequest {
             chat_options: ChatOptions::default(),
             tools: Vec::new(),
             tool_choice: ChatToolChoice::None,
-            parallel_tool_calls: true,
             decode_options: TextDecodeOptions::default(),
             intermediate: true,
             priority: 0,
@@ -490,7 +481,7 @@ impl ChatRequest {
     /// Return true if this request should enable tool parsing based on the tool
     /// choice and tool list.
     pub(crate) fn tool_parsing_enabled(&self) -> bool {
-        !matches!(self.tool_choice, ChatToolChoice::None) && !self.tools.is_empty()
+        matches!(self.tool_choice, ChatToolChoice::Auto) && !self.tools.is_empty()
     }
 
     /// Return the request-level thinking toggle when explicitly requested.

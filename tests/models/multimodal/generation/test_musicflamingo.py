@@ -59,12 +59,6 @@ def get_fixture_path(filename):
     )
 
 
-def load_expected_fixture(filename):
-    fixture_path = get_fixture_path(filename)
-    with open(fixture_path) as f:
-        return json.load(f)
-
-
 def assert_output_matches(output, expected_text, expected_token_ids):
     generated = output.outputs[0]
     assert generated.text == expected_text
@@ -82,7 +76,7 @@ def llm():
     model_info.check_transformers_version(on_fail="skip")
 
     try:
-        llm = LLM(
+        return LLM(
             model=MODEL_NAME,
             dtype="bfloat16",
             enforce_eager=True,
@@ -92,19 +86,14 @@ def llm():
     except Exception as e:
         pytest.skip(f"Failed to load model {MODEL_NAME}: {e}")
 
-    # ROCm may compile decoder kernels on the first inference pass; warm up
-    # once so exact fixture assertions cover the steady-state path.
-    llm.chat(
-        messages=SINGLE_CONVERSATION,
-        sampling_params=SamplingParams(temperature=0.0, max_tokens=1),
-        use_tqdm=False,
-    )
-
-    return llm
-
 
 def test_single_generation(llm):
-    expected = load_expected_fixture("expected_results_single.json")
+    fixture_path = get_fixture_path("expected_results_single.json")
+    if not os.path.exists(fixture_path):
+        pytest.skip(f"Fixture not found: {fixture_path}")
+
+    with open(fixture_path) as f:
+        expected = json.load(f)
 
     outputs = llm.chat(
         messages=SINGLE_CONVERSATION,
@@ -119,7 +108,12 @@ def test_single_generation(llm):
 
 
 def test_batched_generation(llm):
-    expected = load_expected_fixture("expected_results_batched.json")
+    fixture_path = get_fixture_path("expected_results_batched.json")
+    if not os.path.exists(fixture_path):
+        pytest.skip(f"Fixture not found: {fixture_path}")
+
+    with open(fixture_path) as f:
+        expected = json.load(f)
 
     outputs = llm.chat(
         messages=BATCHED_CONVERSATIONS,

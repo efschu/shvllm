@@ -2,14 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """TokenSpeed CuTe DSL backend for MLA prefill."""
 
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING
 
 import torch
 
-from vllm.v1.attention.backends.mla.prefill.base import (
-    MLADimensions,
-    MLAPrefillBackend,
-)
+from vllm.v1.attention.backends.mla.prefill.base import MLAPrefillBackend
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -22,13 +19,7 @@ if TYPE_CHECKING:
 class TokenspeedMLAPrefillBackend(MLAPrefillBackend):
     """TokenSpeed CuTe DSL backend for MLA prefill."""
 
-    supported_mla_dimensions: ClassVar[list[MLADimensions]] = [
-        MLADimensions(
-            qk_nope_head_dim=128,
-            qk_rope_head_dim=64,
-            v_head_dim=128,
-        ),
-    ]
+    requires_r1_mla_dimensions = True
 
     @staticmethod
     def get_name() -> str:
@@ -124,8 +115,6 @@ class TokenspeedMLAPrefillBackend(MLAPrefillBackend):
         k: torch.Tensor,
         v: torch.Tensor,
         return_softmax_lse: bool,
-        out: torch.Tensor | None = None,
-        output_scale: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         from tokenspeed_mla import tokenspeed_mla_prefill
 

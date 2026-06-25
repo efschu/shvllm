@@ -168,7 +168,11 @@ class CompletionRequestMixin(OpenAIBaseModel):
     # --8<-- [end:completion-extra-params]
 
 
-class ChatRequestOptionsMixin(OpenAIBaseModel):
+class ChatRequestMixin(OpenAIBaseModel):
+    # --8<-- [start:chat-params]
+    messages: list[ChatCompletionMessageParam]
+    # --8<-- [end:chat-params]
+
     # --8<-- [start:chat-extra-params]
     add_generation_prompt: bool = Field(
         default=False,
@@ -250,12 +254,6 @@ class ChatRequestOptionsMixin(OpenAIBaseModel):
             ),
             media_io_kwargs=self.media_io_kwargs,
         )
-
-
-class ChatRequestMixin(ChatRequestOptionsMixin):
-    # --8<-- [start:chat-params]
-    messages: list[ChatCompletionMessageParam]
-    # --8<-- [end:chat-params]
 
 
 class EncodingRequestMixin(OpenAIBaseModel):

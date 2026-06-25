@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import time
-import weakref
 from collections.abc import Callable, Mapping
 from copy import copy
 from typing import Any
@@ -123,14 +122,6 @@ class LLMEngine:
         if not multiprocess_mode:
             # for v0 compatibility
             self.model_executor = self.engine_core.engine_core.model_executor  # type: ignore
-
-            # Capture the model while reachable so the finalizer can drop the
-            # bytecode hooks pinning it (frees GPU memory on engine deletion).
-            model = self._get_driver_model_for_cleanup()
-            if model is not None:
-                self._finalizer = weakref.finalize(
-                    self, LLMEngine._cleanup_instance_caches, model
-                )
 
         if self.external_launcher_dp:
             # If we use DP in external launcher mode, we reuse the
@@ -427,20 +418,6 @@ class LLMEngine:
 
     def apply_model(self, func: Callable[[nn.Module], _R]) -> list[_R]:
         return self.collective_rpc("apply_model", args=(func,))
-
-    def _get_driver_model_for_cleanup(self) -> nn.Module | None:
-        driver_worker = getattr(self.model_executor, "driver_worker", None)
-        model_runner = getattr(driver_worker, "model_runner", None)
-        return getattr(model_runner, "model", None)
-
-    @staticmethod
-    def _cleanup_instance_caches(model) -> None:
-        """Remove the bytecode hooks that pin the compiled model."""
-        from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
-
-        for module in model.modules():
-            if isinstance(module, TorchCompileWithNoGuardsWrapper):
-                module.cleanup()
 
     def __del__(self):
         dp_group = getattr(self, "dp_group", None)

@@ -392,14 +392,6 @@ class GroupCoordinator:
 
         self.rank = torch.distributed.get_rank()
         self.local_rank = local_rank
-        self.device_index: int
-        if _WORLD is not None:
-            self.device_index = _WORLD.device_index
-        else:
-            assert local_rank >= 0, (
-                "local_rank must be provided when creating the world group"
-            )
-            self.device_index = local_rank
 
         self_device_group = None
         self_cpu_group = None
@@ -450,18 +442,11 @@ class GroupCoordinator:
         from vllm.platforms import current_platform
 
         if current_platform.is_cuda_alike():
-            visible_device_index = (
-                current_platform.logical_device_id_to_visible_device_id(
-                    self.device_index
-                )
-            )
-            self.device = torch.device(f"cuda:{visible_device_index}")
+            self.device = torch.device(f"cuda:{local_rank}")
         elif current_platform.is_xpu():
-            self.device = torch.device(f"xpu:{self.device_index}")
+            self.device = torch.device(f"xpu:{local_rank}")
         elif current_platform.is_out_of_tree():
-            self.device = torch.device(
-                f"{current_platform.device_name}:{self.device_index}"
-            )
+            self.device = torch.device(f"{current_platform.device_name}:{local_rank}")
         else:
             self.device = torch.device("cpu")
 
@@ -648,7 +633,12 @@ class GroupCoordinator:
             raise ValueError("No device communicator found")
         return self.device_communicator.all_reduce(input_)
 
-    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    def all_gather(
+        self,
+        input_: torch.Tensor,
+        dim: int = -1,
+        partition_sizes: list[int] | None = None,
+    ) -> torch.Tensor:
         world_size = self.world_size
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
@@ -656,6 +646,21 @@ class GroupCoordinator:
         assert -input_.dim() <= dim < input_.dim(), (
             f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
         )
+
+        # Heterogeneous TP path: when ``partition_sizes`` is provided (or the
+        # global is set) and the local chunk's size matches the expected
+        # shard for this rank, run the pad-gather-slice scheme so unequal
+        # chunks can be all-gathered over NCCL. Falls back to the legacy
+        # equal-chunk ``all_gather`` when the chunk shape doesn't match the
+        # expected size (this is the contract for replicated tensors passed
+        # through ``tensor_model_parallel_all_gather``).
+        if partition_sizes is None:
+            partition_sizes = get_tp_partition_sizes()
+        if partition_sizes is not None:
+            local_size = input_.size(dim) if dim >= 0 else input_.size(dim)
+            expected = partition_sizes[self.rank_in_group]
+            if local_size == expected:
+                return self._het_tp_all_gather(input_, dim, partition_sizes)
 
         if self.use_custom_op_call:
             return torch.ops.vllm.all_gather(
@@ -669,14 +674,67 @@ class GroupCoordinator:
             raise ValueError("No device communicator found")
         return self.device_communicator.all_gather(input_, dim)
 
+    def _het_tp_all_gather(
+        self,
+        input_: torch.Tensor,
+        dim: int,
+        partition_sizes: list[int],
+    ) -> torch.Tensor:
+        """Pad-gather-slice implementation for heterogeneous TP.
+
+        Called only when the local chunk's ``dim`` size matches the rank's
+        expected shard size in ``partition_sizes``. Runs:
+
+        1. ``F.pad`` to ``max(partition_sizes)`` along ``dim`` (no-op when
+           this rank is already the largest).
+        2. Equal-chunk NCCL ``all_gather`` on the padded tensors.
+        3. ``torch.cat`` of per-rank slices ``gathered[..., i*max_size :
+           i*max_size + partition_sizes[i]]``.
+        """
+        import torch.nn.functional as F
+
+        max_size = max(partition_sizes)
+        local_size = input_.size(dim)
+        pad_size = max_size - local_size
+        if pad_size > 0:
+            if dim == input_.dim() - 1 or dim == -1:
+                padded = F.pad(input_, (0, pad_size))
+            else:
+                perm = list(range(input_.dim()))
+                perm.append(perm.pop(dim))
+                padded = (
+                    F.pad(input_.permute(*perm), (0, pad_size))
+                    .permute(*sorted(range(len(perm)), key=lambda i: perm[i]))
+                )
+        else:
+            padded = input_
+
+        # Equal-chunk NCCL ``all_gather`` (no recursion: we call the custom
+        # op / device communicator directly, not ``self.all_gather``).
+        if self.use_custom_op_call:
+            gathered = torch.ops.vllm.all_gather(
+                padded, dim, self.world_size, group_name=self.unique_name
+            )
+        else:
+            gathered = self.device_communicator.all_gather(padded, dim)
+
+        # Slice each rank's contribution and concatenate along ``dim``.
+        slices = []
+        for i, p in enumerate(partition_sizes):
+            if p == 0:
+                continue
+            start = i * max_size
+            slices.append(gathered.narrow(dim, start, p))
+        if len(slices) == 1:
+            return slices[0]
+        return torch.cat(slices, dim=dim)
+
     def all_gatherv(
         self,
         input_: torch.Tensor | list[torch.Tensor],
         dim: int = 0,
         sizes: list[int] | None = None,
     ):
-        if self.device_communicator is None:
-            raise ValueError("No device communicator found")
         return self.device_communicator.all_gatherv(input_, dim, sizes)
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
@@ -1345,6 +1403,14 @@ def _replace_active_groups(
 
 _TP: GroupCoordinator | None = None
 
+# Per-rank column/row partition sizes for heterogeneous tensor parallelism.
+# ``_TP_PARTITION_SIZES[i]`` is the number of columns (ColumnParallel) or rows
+# (RowParallel) assigned to TP rank ``i``. When unset, callers should fall back
+# to a uniform ``[total // tp_size] * tp_size`` split that matches the current
+# behaviour. Set by the worker init path from ``ParallelConfig`` after the TP
+# group is created.
+_TP_PARTITION_SIZES: list[int] | None = None
+
 
 def get_tp_group() -> GroupCoordinator:
     assert _TP is not None, "tensor model parallel group is not initialized"
@@ -1453,12 +1519,7 @@ def _init_process_group_for_split_group(
     """
     if torch.accelerator.is_available() and backend != "gloo":
         init_backend = "cpu:gloo,cuda:nccl"
-        from vllm.platforms import current_platform
-
-        visible_device_index = current_platform.logical_device_id_to_visible_device_id(
-            local_rank
-        )
-        device_id: torch.device | None = torch.device(f"cuda:{visible_device_index}")
+        device_id: torch.device | None = torch.device(f"cuda:{local_rank}")
     else:
         init_backend = "gloo"
         device_id = None
@@ -2019,11 +2080,60 @@ def get_tensor_model_parallel_rank() -> int:
     return get_tp_group().rank_in_group
 
 
+def set_tp_partition_sizes(sizes: list[int]) -> None:
+    """Set the per-rank TP column/row partition sizes for heterogeneous TP.
+
+    ``sizes[i]`` is the number of columns (ColumnParallel) or rows
+    (RowParallel) assigned to TP rank ``i``. Must have one entry per TP rank
+    and all entries must be positive integers.
+    """
+    global _TP_PARTITION_SIZES
+    assert _TP is not None, "tensor model parallel group is not initialized"
+    world_size = get_tensor_model_parallel_world_size()
+    assert len(sizes) == world_size, (
+        f"partition sizes length ({len(sizes)}) must equal TP world size "
+        f"({world_size})"
+    )
+    assert all(s > 0 for s in sizes), (
+        f"all partition sizes must be positive, got {sizes}"
+    )
+    _TP_PARTITION_SIZES = list(sizes)
+
+
+def get_tp_partition_sizes() -> list[int] | None:
+    """Return the per-rank TP partition sizes, or ``None`` if unset.
+
+    Callers that handle only uniform splits should use
+    :func:`get_tp_partition_sizes_or_uniform` instead.
+    """
+    return _TP_PARTITION_SIZES
+
+
+def get_tp_partition_sizes_or_uniform(total_size: int | None = None) -> list[int]:
+    """Return the per-rank TP partition sizes.
+
+    If partition sizes were explicitly set via :func:`set_tp_partition_sizes`,
+    those are returned. Otherwise, a uniform ``[size // tp_size] * tp_size``
+    split is returned, preserving the pre-heterogeneous-TP behaviour.
+    """
+    if _TP_PARTITION_SIZES is not None:
+        return _TP_PARTITION_SIZES
+    tp_size = get_tensor_model_parallel_world_size()
+    if total_size is None:
+        # Caller didn't supply a total; callers that don't actually need the
+        # absolute sizes (e.g. all_gather of replicated tensors) get a
+        # per-rank 1 fallback that sums to tp_size.
+        return [1] * tp_size
+    base, rem = divmod(total_size, tp_size)
+    return [base + (1 if i < rem else 0) for i in range(tp_size)]
+
+
+
+
 def get_node_count() -> int:
     """Return the total number of nodes in the distributed environment."""
     assert _NODE_COUNT is not None, "distributed environment is not initialized"
     return _NODE_COUNT
-
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
@@ -2032,6 +2142,9 @@ def destroy_model_parallel():
     if _TP:
         _TP.destroy()
     _TP = None
+
+    global _TP_PARTITION_SIZES
+    _TP_PARTITION_SIZES = None
 
     global _DCP
     if _DCP:

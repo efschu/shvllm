@@ -1,15 +1,11 @@
 group: Models - Multimodal
-depends_on:
+depends_on: 
   - image-build-xpu
 steps:
 - label: "Multi-Modal Models (Standard) 1: qwen2"
   key: multi-modal-models-standard-1-qwen2
   timeout_in_minutes: 45
   device: intel_gpu
-  agent_tags:
-    label: production
-    gpu: 1+
-    mem: 16+
   no_plugin: true
   working_dir: "."
   env:
@@ -31,10 +27,6 @@ steps:
   key: multi-modal-models-standard-2-qwen3-gemma
   timeout_in_minutes: 45
   device: intel_gpu
-  agent_tags:
-    label: production
-    gpu: 1+
-    mem: 16+
   no_plugin: true
   working_dir: "."
   env:
@@ -55,10 +47,6 @@ steps:
   key: multi-modal-models-standard-3-llava-qwen2-vl
   timeout_in_minutes: 45
   device: intel_gpu
-  agent_tags:
-    label: production
-    gpu: 1+
-    mem: 24+
   no_plugin: true
   working_dir: "."
   env:
@@ -80,10 +68,6 @@ steps:
   key: multi-modal-models-standard-4-other-whisper
   timeout_in_minutes: 45
   device: intel_gpu
-  agent_tags:
-    label: production
-    gpu: 1+
-    mem: 16+
   no_plugin: true
   working_dir: "."
   env:
@@ -104,10 +88,6 @@ steps:
   key: multi-modal-processor
   timeout_in_minutes: 45
   device: intel_gpu
-  agent_tags:
-    label: production
-    gpu: 1+
-    mem: 16+
   no_plugin: true
   working_dir: "."
   env:

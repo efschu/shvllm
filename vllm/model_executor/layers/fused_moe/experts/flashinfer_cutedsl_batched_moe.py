@@ -49,9 +49,6 @@ class FlashInferCuteDSLBatchedExperts(mk.FusedMoEExpertsModular):
             "Only nvfp4 quantization are currently supported."
         )
         self.out_dtype = moe_config.in_dtype
-        self.use_deep_ep_ll_nvfp4_dispatch = (
-            envs.VLLM_DEEPEPLL_NVFP4_DISPATCH and moe_config.use_deepep_ll_kernels
-        )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.w13_weight_scale_2.data.mul_(layer.w13_input_scale)
@@ -126,7 +123,7 @@ class FlashInferCuteDSLBatchedExperts(mk.FusedMoEExpertsModular):
 
         # We use global_num_experts due to how moe_align_block_size handles
         # expert_maps.
-        K_dim = K * 2 if self.use_deep_ep_ll_nvfp4_dispatch else K
+        K_dim = K * 2 if envs.VLLM_DEEPEPLL_NVFP4_DISPATCH else K
         output_shape = (local_num_experts, M, K_dim)
         workspace2 = (local_num_experts, M, N)
         workspace1 = output_shape
@@ -164,11 +161,11 @@ class FlashInferCuteDSLBatchedExperts(mk.FusedMoEExpertsModular):
         assert self.w2_scale.ndim == 3
 
         input_global_scale = (
-            None if self.use_deep_ep_ll_nvfp4_dispatch else self.a1_gscale
+            None if envs.VLLM_DEEPEPLL_NVFP4_DISPATCH else self.a1_gscale
         )
         flashinfer_hidden_states = (
             (hidden_states, a1q_scale)
-            if self.use_deep_ep_ll_nvfp4_dispatch
+            if envs.VLLM_DEEPEPLL_NVFP4_DISPATCH
             else hidden_states
         )
         flashinfer_cutedsl_moe_masked(

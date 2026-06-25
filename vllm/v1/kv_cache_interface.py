@@ -41,8 +41,7 @@ class KVQuantMode(IntEnum):
     FP8_PER_TENSOR = 1  # per-tensor scales (current fp8 path)
     INT8_PER_TOKEN_HEAD = 2  # per-token-head dynamic scales for int8
     FP8_PER_TOKEN_HEAD = 3  # per-token-head dynamic scales for fp8
-    INT4_PER_TOKEN_HEAD = 4  # packed 2×int4/byte, RHT + asymmetric zp
-    NVFP4 = 5  # packed fp4 data + fp8 block scales
+    NVFP4 = 4  # packed fp4 data + fp8 block scales
 
     @property
     def is_per_token_head(self) -> bool:
@@ -50,7 +49,6 @@ class KVQuantMode(IntEnum):
         return self in (
             KVQuantMode.INT8_PER_TOKEN_HEAD,
             KVQuantMode.FP8_PER_TOKEN_HEAD,
-            KVQuantMode.INT4_PER_TOKEN_HEAD,
         )
 
     @property
@@ -61,8 +59,6 @@ class KVQuantMode(IntEnum):
 
 def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
     """Map a ``kv_cache_dtype`` string to a :class:`KVQuantMode`."""
-    if kv_cache_dtype == "int4_per_token_head":
-        return KVQuantMode.INT4_PER_TOKEN_HEAD
     if kv_cache_dtype == "int8_per_token_head":
         return KVQuantMode.INT8_PER_TOKEN_HEAD
     if kv_cache_dtype == "fp8_per_token_head":
@@ -167,7 +163,6 @@ class AttentionSpec(KVCacheSpec):
     dtype: torch.dtype
     kv_quant_mode: KVQuantMode = KVQuantMode.NONE
     page_size_padded: int | None = None
-    indexes_kv_by_block_stride: bool = False
 
     @property
     def page_size_bytes(self) -> int:
@@ -188,16 +183,19 @@ class AttentionSpec(KVCacheSpec):
     def real_page_size_bytes(self) -> int:
         if self.kv_quant_mode.is_nvfp4:
             # Packed layout: fp4 data + fp8 block scales per head.
-            head_dim = nvfp4_kv_cache_full_dim(self.head_size)
-        elif self.kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
-            head_dim = self.head_size // 2
-        else:
-            head_dim = self.head_size
+            full_dim = nvfp4_kv_cache_full_dim(self.head_size)
+            return (
+                2
+                * self.block_size
+                * self.num_kv_heads
+                * full_dim
+                * get_dtype_size(self.dtype)
+            )
         return (
             2
             * self.block_size
             * self.num_kv_heads
-            * head_dim
+            * self.head_size
             * get_dtype_size(self.dtype)
         )
 
@@ -220,15 +218,6 @@ class FullAttentionSpec(AttentionSpec):
     Default to None for not using sliding window attention.
     """
     attention_chunk_size: int | None = None
-
-    non_causal: bool = False
-    """
-    Whether the layer attends non-causally (e.g. Prefix LM). Carried on the
-    spec so the engine core, which collects specs from all workers before the
-    scheduler is built, can adjust scheduling policy (chunked prefill / prefix
-    caching) regardless of tensor-parallel layout. It does not affect the KV
-    cache layout itself.
-    """
 
     def __post_init__(self):
         if self.head_size_v is None:
@@ -285,12 +274,8 @@ class FullAttentionSpec(AttentionSpec):
             dtype=specs[0].dtype,
             kv_quant_mode=specs[0].kv_quant_mode,
             page_size_padded=specs[0].page_size_padded,
-            indexes_kv_by_block_stride=specs[0].indexes_kv_by_block_stride,
             sliding_window=cls.merge_window_sizes(sliding_window),
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),
-            # If any layer in the group is non-causal, treat the group as
-            # non-causal so the engine core disables incompatible scheduling.
-            non_causal=any(spec.non_causal for spec in specs),
         )
         for spec in specs:
             for f in fields(AttentionSpec):
@@ -315,12 +300,17 @@ class FullAttentionSpec(AttentionSpec):
             last_dim = nvfp4_kv_cache_full_dim(
                 self.head_size
             ) + nvfp4_kv_cache_full_dim(self.head_size_v)
-        elif self.kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
-            last_dim = self.head_size // 2 + self.head_size_v // 2
-        else:
-            last_dim = self.head_size + self.head_size_v
+            return (
+                self.block_size
+                * self.num_kv_heads
+                * last_dim
+                * get_dtype_size(self.dtype)
+            )
         return (
-            self.block_size * self.num_kv_heads * last_dim * get_dtype_size(self.dtype)
+            self.block_size
+            * self.num_kv_heads
+            * (self.head_size + self.head_size_v)
+            * get_dtype_size(self.dtype)
         )
 
 
@@ -386,14 +376,10 @@ class MLAAttentionSpec(FullAttentionSpec):
             # V3.2 main MLA: 656-byte custom layout (kv_lora_rank=512 +
             # qk_rope_head_dim=64, head_size=576). See flashmla_sparse.py.
             return self.block_size * 656
-        if self.kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
-            head_dim = self.head_size // 2
-        else:
-            head_dim = self.head_size
         return (
             self.storage_block_size
             * self.num_kv_heads
-            * head_dim
+            * self.head_size
             * get_dtype_size(self.dtype)
         )
 
@@ -405,16 +391,13 @@ class MLAAttentionSpec(FullAttentionSpec):
         cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
         compress_ratio_set = set(spec.compress_ratio for spec in specs)
         model_version_set = set(spec.model_version for spec in specs)
-        block_stride_set = set(spec.indexes_kv_by_block_stride for spec in specs)
         assert (
             len(cache_dtype_str_set) == 1
             and len(compress_ratio_set) == 1
             and len(model_version_set) == 1
-            and len(block_stride_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
-            "quantization method, compress ratio, model version, and KV block "
-            "stride indexing."
+            "quantization method, compress ratio, and model version."
         )
         return cls(
             block_size=specs[0].block_size,
@@ -423,7 +406,6 @@ class MLAAttentionSpec(FullAttentionSpec):
             dtype=specs[0].dtype,
             kv_quant_mode=specs[0].kv_quant_mode,
             page_size_padded=specs[0].page_size_padded,
-            indexes_kv_by_block_stride=block_stride_set.pop(),
             cache_dtype_str=cache_dtype_str_set.pop(),
             compress_ratio=compress_ratio_set.pop(),
             model_version=model_version_set.pop(),
@@ -590,17 +572,15 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         compress_ratio_set = set(spec.compress_ratio for spec in specs)
         model_version_set = set(spec.model_version for spec in specs)
         sliding_window_set = set(spec.sliding_window for spec in specs)
-        block_stride_set = set(spec.indexes_kv_by_block_stride for spec in specs)
         assert (
             len(cache_dtype_str_set) == 1
             and len(compress_ratio_set) == 1
             and len(model_version_set) == 1
             and len(sliding_window_set) == 1
-            and len(block_stride_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
-            "quantization method, compress ratio, model version, sliding "
-            "window size, and KV block stride indexing."
+            "quantization method, compress ratio, model version and sliding "
+            "window size."
         )
         return cls(
             block_size=specs[0].block_size,
@@ -608,7 +588,6 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             head_size=specs[0].head_size,
             dtype=specs[0].dtype,
             page_size_padded=specs[0].page_size_padded,
-            indexes_kv_by_block_stride=block_stride_set.pop(),
             sliding_window=sliding_window_set.pop(),
             cache_dtype_str=cache_dtype_str_set.pop(),
             compress_ratio=compress_ratio_set.pop(),
@@ -720,10 +699,8 @@ class SinkFullAttentionSpec(FullAttentionSpec):
             dtype=specs[0].dtype,
             kv_quant_mode=specs[0].kv_quant_mode,
             page_size_padded=specs[0].page_size_padded,
-            indexes_kv_by_block_stride=specs[0].indexes_kv_by_block_stride,
             sliding_window=cls.merge_window_sizes(sliding_window),
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),
-            non_causal=any(spec.non_causal for spec in specs),
         )
         for spec in specs:
             for f in fields(AttentionSpec):
@@ -857,8 +834,6 @@ class KVCacheTensor:
 
     size: int  # size of the KV cache tensor in bytes
     shared_by: list[str]  # layer names that share the same KV cache tensor
-    offset: int = 0  # byte offset of this layer within a contiguous block
-    block_stride: int = 0  # total bytes per block in a packed layout (0 = not packed)
 
 
 @dataclass

@@ -10,7 +10,7 @@ from vllm.v1.engine.llm_engine import LLMEngine
 
 
 class DummyV1Scheduler(Scheduler):
-    def schedule(self, throttle_prefills: bool = False):
+    def schedule(self):
         raise Exception("Exception raised by DummyV1Scheduler")
 
 

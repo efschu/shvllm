@@ -17,10 +17,10 @@ from vllm.entrypoints.serve.disagg.protocol import (
     GenerateResponse,
 )
 from vllm.entrypoints.serve.disagg.serving import ServingTokens
+from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 from vllm.logprobs import Logprob
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.renderers import renderer_from_config
-from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine.async_llm import AsyncLLM
 
@@ -92,9 +92,10 @@ def _build_serving_tokens(engine: AsyncLLM, **kwargs) -> ServingTokens:
         engine_client=engine,
         base_model_paths=BASE_MODEL_PATHS,
     )
-    online_renderer = OnlineRenderer(
+    serving_render = OpenAIServingRender(
         model_config=engine.model_config,
         renderer=engine.renderer,
+        model_registry=models.registry,
         request_logger=None,
         chat_template=None,
         chat_template_content_format="auto",
@@ -102,7 +103,7 @@ def _build_serving_tokens(engine: AsyncLLM, **kwargs) -> ServingTokens:
     serving = ServingTokens(
         engine,
         models,
-        online_renderer=online_renderer,
+        openai_serving_render=serving_render,
         request_logger=None,
         **kwargs,
     )
@@ -110,7 +111,7 @@ def _build_serving_tokens(engine: AsyncLLM, **kwargs) -> ServingTokens:
     async def _fake_preprocess(*args, **kwargs):
         return [{"prompt_token_ids": [1, 2, 3]}]
 
-    serving.online_renderer.preprocess_completion = AsyncMock(
+    serving.openai_serving_render.preprocess_completion = AsyncMock(
         side_effect=_fake_preprocess
     )
     return serving
@@ -198,7 +199,9 @@ async def test_serve_tokens_skips_mm_cache_for_remote_engine_execution():
 
     assert isinstance(response, GenerateResponse)
     assert (
-        serving.online_renderer.preprocess_completion.call_args.kwargs["skip_mm_cache"]
+        serving.openai_serving_render.preprocess_completion.call_args.kwargs[
+            "skip_mm_cache"
+        ]
         is True
     )
 

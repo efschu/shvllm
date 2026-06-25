@@ -13,9 +13,8 @@ from tqdm import tqdm
 
 from vllm.benchmarks.lib.utils import convert_to_pytorch_benchmark_format, write_to_json
 from vllm.engine.arg_utils import EngineArgs
-from vllm.inputs import TextPrompt, TokensPrompt
+from vllm.inputs import PromptType
 from vllm.sampling_params import BeamSearchParams
-from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 
 def save_to_pytorch_benchmark_format(
@@ -31,7 +30,7 @@ def save_to_pytorch_benchmark_format(
         write_to_json(pt_file, pt_records)
 
 
-def add_cli_args(parser: FlexibleArgumentParser):
+def add_cli_args(parser: argparse.ArgumentParser):
     parser.add_argument("--input-len", type=int, default=32)
     parser.add_argument("--output-len", type=int, default=128)
     parser.add_argument("--batch-size", type=int, default=8)
@@ -104,9 +103,8 @@ def main(args: argparse.Namespace):
     dummy_prompt_token_ids = np.random.randint(
         10000, size=(args.batch_size, args.input_len)
     )
-    dummy_prompts: list[TokensPrompt | TextPrompt] = [
-        TokensPrompt(prompt_token_ids=batch)
-        for batch in dummy_prompt_token_ids.tolist()
+    dummy_prompts: list[PromptType] = [
+        {"prompt_token_ids": batch} for batch in dummy_prompt_token_ids.tolist()
     ]
 
     def llm_generate():

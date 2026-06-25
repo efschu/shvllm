@@ -15,7 +15,7 @@ Register a lazy module mapping.
 Example:
     ToolParserManager.register_lazy_module(
         name="kimi_k2",
-        module_path="vllm.tool_parsers.kimi_k2_tool_parser",
+        module_path="vllm.tool_parsers.kimi_k2_parser",
         class_name="KimiK2ToolParser",
     )
 """
@@ -51,8 +51,8 @@ _TOOL_PARSERS_TO_REGISTER = {
         "Ernie45ToolParser",
     ),
     "glm45": (
-        "glm47_moe_tool_parser",
-        "Glm47MoeModelToolParser",
+        "glm4_moe_tool_parser",
+        "Glm4MoeModelToolParser",
     ),
     "glm47": (
         "glm47_moe_tool_parser",
@@ -119,16 +119,16 @@ _TOOL_PARSERS_TO_REGISTER = {
         "LongcatFlashToolParser",
     ),
     "mimo": (
-        "qwen3_engine_tool_parser",
-        "Qwen3EngineToolParser",
+        "qwen3coder_tool_parser",
+        "Qwen3CoderToolParser",
     ),
     "minimax_m2": (
         "minimax_m2_tool_parser",
         "MinimaxM2ToolParser",
     ),
-    "minimax_m3": (
-        "minimax_m3_tool_parser",
-        "MinimaxM3ToolParser",
+    "minimax": (
+        "minimax_tool_parser",
+        "MinimaxToolParser",
     ),
     "minicpm5": (
         "minicpm5xml_tool_parser",
@@ -155,12 +155,12 @@ _TOOL_PARSERS_TO_REGISTER = {
         "PythonicToolParser",
     ),
     "qwen3_coder": (
-        "qwen3_engine_tool_parser",
-        "Qwen3EngineToolParser",
+        "qwen3coder_tool_parser",
+        "Qwen3CoderToolParser",
     ),
     "qwen3_xml": (
-        "qwen3_engine_tool_parser",
-        "Qwen3EngineToolParser",
+        "qwen3coder_tool_parser",
+        "Qwen3CoderToolParser",
     ),
     "seed_oss": (
         "seed_oss_tool_parser",
@@ -187,8 +187,8 @@ _TOOL_PARSERS_TO_REGISTER = {
         "FunctionGemmaToolParser",
     ),
     "gemma4": (
-        "gemma4_engine_tool_parser",
-        "Gemma4EngineToolParser",
+        "gemma4_tool_parser",
+        "Gemma4ToolParser",
     ),
     "apertus": (
         "apertus_tool_parser",

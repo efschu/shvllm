@@ -6,7 +6,6 @@ import copy
 import dataclasses
 import functools
 import json
-import os
 import sys
 from collections.abc import Callable
 from dataclasses import MISSING, asdict, dataclass, fields, is_dataclass
@@ -74,7 +73,6 @@ from vllm.config.cache import (
 )
 from vllm.config.device import Device
 from vllm.config.kernel import IrOpPriorityConfig, LinearBackend, MoEBackend
-from vllm.config.load import SafetensorsLoadStrategy
 from vllm.config.lora import MaxLoRARanks
 from vllm.config.mamba import MambaBackendEnum
 from vllm.config.model import (
@@ -105,6 +103,7 @@ from vllm.transformers_utils.config import (
     is_interleaved,
     maybe_override_with_speculators,
 )
+from vllm.transformers_utils.gguf_utils import is_gguf
 from vllm.transformers_utils.repo_utils import get_model_path
 from vllm.transformers_utils.utils import is_cloud_storage
 from vllm.utils.argparse_utils import (
@@ -284,6 +283,35 @@ def _expand_json_human_readable_numbers(val: str) -> str:
     return "".join(parts)
 
 
+def _parse_tp_weights(value: str | None) -> list[float] | None:
+    """Parse the ``--tensor-parallel-weights`` CLI string.
+
+    Accepts a comma-separated list of floats (e.g. ``"2,1,1"``) and returns
+    the corresponding ``list[float]``. Whitespace around entries is stripped,
+    empty values are rejected. Returns ``None`` for ``None``/empty input so
+    the resulting ``ParallelConfig.tensor_parallel_weights`` is ``None`` and
+    every TP rank receives an equal share.
+    """
+    if value is None:
+        return None
+    stripped = value.strip()
+    if not stripped:
+        return None
+    try:
+        weights = [float(part.strip()) for part in stripped.split(",")]
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(
+            f"--tensor-parallel-weights expects comma-separated floats, "
+            f"got {value!r}"
+        ) from e
+    if len(weights) < 1:
+        raise argparse.ArgumentTypeError(
+            "--tensor-parallel-weights requires at least one entry"
+        )
+    return weights
+
+
+
 @functools.lru_cache(maxsize=30)
 def _compute_kwargs(cls: ConfigType) -> dict[str, dict[str, Any]]:
     # Save time only getting attr docs if we're generating help text
@@ -429,9 +457,7 @@ class EngineArgs:
     allowed_local_media_path: str = ModelConfig.allowed_local_media_path
     allowed_media_domains: list[str] | None = ModelConfig.allowed_media_domains
     download_dir: str | None = LoadConfig.download_dir
-    safetensors_load_strategy: SafetensorsLoadStrategy | None = (
-        LoadConfig.safetensors_load_strategy
-    )
+    safetensors_load_strategy: str | None = LoadConfig.safetensors_load_strategy
     safetensors_prefetch_num_threads: int = LoadConfig.safetensors_prefetch_num_threads
     safetensors_prefetch_block_size: int = LoadConfig.safetensors_prefetch_block_size
     load_format: str | LoadFormats = LoadConfig.load_format
@@ -466,8 +492,11 @@ class EngineArgs:
     numa_bind: bool = ParallelConfig.numa_bind
     numa_bind_nodes: list[int] | None = ParallelConfig.numa_bind_nodes
     numa_bind_cpus: list[str] | None = ParallelConfig.numa_bind_cpus
-    device_ids: list[int | str] | None = None
     tensor_parallel_size: int = ParallelConfig.tensor_parallel_size
+    tensor_parallel_weights: str | None = None
+    """Comma-separated relative weights per TP rank, e.g. ``"2,1,1"``. Must
+    have exactly ``tensor_parallel_size`` entries. When unset or empty, each
+    rank receives an equal share."""
     prefill_context_parallel_size: int = ParallelConfig.prefill_context_parallel_size
     decode_context_parallel_size: int = ParallelConfig.decode_context_parallel_size
     dcp_comm_backend: DCPCommBackend = ParallelConfig.dcp_comm_backend
@@ -604,7 +633,6 @@ class EngineArgs:
     disable_chunked_mm_input: bool = SchedulerConfig.disable_chunked_mm_input
 
     scheduler_reserve_full_isl: bool = SchedulerConfig.scheduler_reserve_full_isl
-    prefill_schedule_interval: int = SchedulerConfig.prefill_schedule_interval
 
     watermark: float = SchedulerConfig.watermark
 
@@ -643,8 +671,6 @@ class EngineArgs:
     enable_logging_iteration_details: bool = (
         ObservabilityConfig.enable_logging_iteration_details
     )
-    jit_monitor_mode: Literal["warn", "error"] = ObservabilityConfig.jit_monitor_mode
-    jit_monitor_verbose: bool = ObservabilityConfig.jit_monitor_verbose
     enable_mm_processor_stats: bool = ObservabilityConfig.enable_mm_processor_stats
     scheduling_policy: SchedulerPolicy = SchedulerConfig.policy
     scheduler_cls: str | type[object] | None = SchedulerConfig.scheduler_cls
@@ -983,21 +1009,17 @@ class EngineArgs:
             "--numa-bind-cpus", **parallel_kwargs["numa_bind_cpus"]
         )
         parallel_group.add_argument(
-            "--device-ids",
-            type=lambda s: [
-                int(device_id) if device_id.isdigit() else device_id
-                for device_id in (part.strip() for part in s.split(","))
-            ],
-            default=None,
-            help="Comma-separated physical GPU device IDs or UUIDs to use "
-            '(e.g. --device-ids "2,3,5,7"). Avoids setting '
-            "CUDA_VISIBLE_DEVICES, preserving full GPU topology "
-            "visibility for GPU-NIC affinity and DeepGEMM. "
-            "Note: has no effect with Ray executors; use Ray "
-            "placement groups for GPU selection instead.",
+            "--tensor-parallel-size", "-tp", **parallel_kwargs["tensor_parallel_size"]
         )
         parallel_group.add_argument(
-            "--tensor-parallel-size", "-tp", **parallel_kwargs["tensor_parallel_size"]
+            "--tensor-parallel-weights",
+            type=str,
+            default=None,
+            help=(
+                "Comma-separated relative weights per TP rank, e.g. '2,1,1'. "
+                "Must have exactly --tensor-parallel-size entries, all > 0. "
+                "When unset, each TP rank receives an equal share."
+            ),
         )
         parallel_group.add_argument(
             "--decode-context-parallel-size",
@@ -1379,14 +1401,6 @@ class EngineArgs:
             "--enable-logging-iteration-details",
             **observability_kwargs["enable_logging_iteration_details"],
         )
-        observability_group.add_argument(
-            "--jit-monitor-mode",
-            **observability_kwargs["jit_monitor_mode"],
-        )
-        observability_group.add_argument(
-            "--jit-monitor-verbose",
-            **observability_kwargs["jit_monitor_verbose"],
-        )
 
         # Scheduler arguments
         scheduler_kwargs = get_kwargs(SchedulerConfig)
@@ -1442,10 +1456,6 @@ class EngineArgs:
             **scheduler_kwargs["scheduler_reserve_full_isl"],
         )
         scheduler_group.add_argument("--watermark", **scheduler_kwargs["watermark"])
-        scheduler_group.add_argument(
-            "--prefill-schedule-interval",
-            **scheduler_kwargs["prefill_schedule_interval"],
-        )
         scheduler_group.add_argument(
             "--disable-hybrid-kv-cache-manager",
             **scheduler_kwargs["disable_hybrid_kv_cache_manager"],
@@ -1591,6 +1601,10 @@ class EngineArgs:
         return engine_args
 
     def create_model_config(self) -> ModelConfig:
+        # gguf file needs a specific model loader
+        if is_gguf(self.model):
+            self.quantization = self.load_format = "gguf"
+
         if not envs.VLLM_ENABLE_V1_MULTIPROCESSING:
             logger.warning(
                 "The global random seed is set to %d. Since "
@@ -1737,47 +1751,6 @@ class EngineArgs:
         )
         return SpeculativeConfig(**self.speculative_config)
 
-    def _resolve_device_ids(self) -> list[int] | None:
-        if not self.device_ids:
-            return None
-        if self.distributed_executor_backend == "ray":
-            logger.warning(
-                "--device-ids has no effect when using the Ray executor. "
-                "Use Ray placement groups for GPU selection instead."
-            )
-        ids = self.device_ids
-        if len(set(ids)) != len(ids):
-            raise ValueError(f"--device-ids must not contain duplicates: {ids}")
-        if all(isinstance(i, str) for i in ids):
-            return [
-                current_platform.device_control_id_to_physical_device_id(i)
-                for i in cast(list[str], ids)
-            ]
-        if any(isinstance(i, str) for i in ids):
-            raise ValueError("--device-ids must not mix integer IDs and UUIDs")
-        int_ids = cast(list[int], ids)
-        # Compose with CUDA_VISIBLE_DEVICES: if CVD is set, treat
-        # --device-ids values as indices into the CVD-visible set.
-        cvd = getattr(
-            envs,
-            current_platform.device_control_env_var,
-            os.environ.get(current_platform.device_control_env_var),
-        )
-        if cvd:
-            cvd_ids = [
-                current_platform.device_control_id_to_physical_device_id(x)
-                for x in cvd.split(",")
-            ]
-            for i in int_ids:
-                if i >= len(cvd_ids):
-                    raise ValueError(
-                        f"--device-ids index {i} is out of range for "
-                        f"{current_platform.device_control_env_var}"
-                        f"={cvd} ({len(cvd_ids)} devices visible)"
-                    )
-            return [cvd_ids[i] for i in int_ids]
-        return int_ids
-
     def create_diffusion_config(self) -> DiffusionConfig | None:
         if self.diffusion_config is None:
             return None
@@ -1785,22 +1758,6 @@ class EngineArgs:
         if isinstance(cfg, str):
             cfg = json.loads(cfg)
         return DiffusionConfig(**cfg)
-
-    def create_observability_config(self) -> ObservabilityConfig:
-        return ObservabilityConfig(
-            show_hidden_metrics_for_version=self.show_hidden_metrics_for_version,
-            otlp_traces_endpoint=self.otlp_traces_endpoint,
-            collect_detailed_traces=self.collect_detailed_traces,
-            kv_cache_metrics=self.kv_cache_metrics,
-            kv_cache_metrics_sample=self.kv_cache_metrics_sample,
-            cudagraph_metrics=self.cudagraph_metrics,
-            enable_layerwise_nvtx_tracing=self.enable_layerwise_nvtx_tracing,
-            enable_mfu_metrics=self.enable_mfu_metrics,
-            enable_mm_processor_stats=self.enable_mm_processor_stats,
-            enable_logging_iteration_details=self.enable_logging_iteration_details,
-            jit_monitor_mode=self.jit_monitor_mode,
-            jit_monitor_verbose=self.jit_monitor_verbose,
-        )
 
     def create_engine_config(
         self,
@@ -2065,6 +2022,7 @@ class EngineArgs:
         parallel_config = ParallelConfig(
             pipeline_parallel_size=self.pipeline_parallel_size,
             tensor_parallel_size=self.tensor_parallel_size,
+            tensor_parallel_weights=_parse_tp_weights(self.tensor_parallel_weights),
             prefill_context_parallel_size=self.prefill_context_parallel_size,
             data_parallel_size=self.data_parallel_size,
             data_parallel_rank=self.data_parallel_rank or 0,
@@ -2107,7 +2065,6 @@ class EngineArgs:
             cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
             _api_process_count=self._api_process_count,
             _api_process_rank=self._api_process_rank,
-            assigned_physical_gpu_ids=self._resolve_device_ids(),
             numa_bind=self.numa_bind,
             numa_bind_nodes=self.numa_bind_nodes,
             numa_bind_cpus=self.numa_bind_cpus,
@@ -2151,7 +2108,6 @@ class EngineArgs:
             long_prefill_token_threshold=self.long_prefill_token_threshold,
             scheduler_reserve_full_isl=self.scheduler_reserve_full_isl,
             watermark=self.watermark,
-            prefill_schedule_interval=self.prefill_schedule_interval,
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,
@@ -2284,7 +2240,18 @@ class EngineArgs:
                 self.reasoning_parser_plugin
             )
 
-        observability_config = self.create_observability_config()
+        observability_config = ObservabilityConfig(
+            show_hidden_metrics_for_version=self.show_hidden_metrics_for_version,
+            otlp_traces_endpoint=self.otlp_traces_endpoint,
+            collect_detailed_traces=self.collect_detailed_traces,
+            kv_cache_metrics=self.kv_cache_metrics,
+            kv_cache_metrics_sample=self.kv_cache_metrics_sample,
+            cudagraph_metrics=self.cudagraph_metrics,
+            enable_layerwise_nvtx_tracing=self.enable_layerwise_nvtx_tracing,
+            enable_mfu_metrics=self.enable_mfu_metrics,
+            enable_mm_processor_stats=self.enable_mm_processor_stats,
+            enable_logging_iteration_details=self.enable_logging_iteration_details,
+        )
 
         # Compilation config overrides
         compilation_config = copy.deepcopy(self.compilation_config)

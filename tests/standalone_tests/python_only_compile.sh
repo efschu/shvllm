@@ -4,26 +4,9 @@
 
 set -e
 
-# ROCm CI runs this script inside `run-amd-test.sh` where /vllm-workspace often has no .git
-# (wheel artifact layout). The wrapper passes VLLM_STANDALONE_MERGE_BASE from the agent checkout.
-merge_base_commit=""
-if [[ -n "${VLLM_STANDALONE_MERGE_BASE:-}" ]]; then
-    merge_base_commit="${VLLM_STANDALONE_MERGE_BASE}"
-elif merge_base_commit="$(git -C /vllm-workspace merge-base HEAD origin/main 2>/dev/null)"; then
-    :
-elif merge_base_commit="$(git merge-base HEAD origin/main 2>/dev/null)"; then
-    :
-else
-    echo "ERROR: need a git checkout or VLLM_STANDALONE_MERGE_BASE to resolve wheels.vllm.ai commit." >&2
-    exit 1
-fi
-
+merge_base_commit=$(git merge-base HEAD origin/main)
 echo "INFO: current merge base commit with main: $merge_base_commit"
-if git show --oneline -s "$merge_base_commit" 2>/dev/null; then
-    :
-else
-    echo "INFO: git show unavailable in this environment; using SHA above for precompiled metadata."
-fi
+git show --oneline -s "$merge_base_commit"
 
 # test whether the metadata.json url is valid, retry each 3 minutes up to 5 times
 # this avoids cumbersome error messages & manual retries in case the precompiled wheel
@@ -76,12 +59,7 @@ cd /vllm-workspace/
 # uninstall vllm
 pip3 uninstall -y vllm
 # restore the original files
-if [[ -d src/vllm ]]; then
-    mv src/vllm ./vllm
-elif [[ ! -d vllm ]]; then
-    echo "ERROR: expected vllm package at /vllm-workspace/src/vllm or /vllm-workspace/vllm" >&2
-    exit 1
-fi
+mv src/vllm ./vllm
 
 # remove all compilers
 apt remove --purge build-essential -y
@@ -89,14 +67,7 @@ apt autoremove -y
 
 echo 'import os; os.system("touch /tmp/changed.file")' >> vllm/__init__.py
 
-# ROCm CI uses setuptools develop for editable installs (see Dockerfile.rocm and run-amd-test.sh).
-_vllm_target_lower="$(printf '%s' "${VLLM_TARGET_DEVICE:-}" | tr '[:upper:]' '[:lower:]')"
-if [[ "${_vllm_target_lower}" == "rocm" ]]; then
-  VLLM_PRECOMPILED_WHEEL_COMMIT=$merge_base_commit VLLM_USE_PRECOMPILED=1 python3 setup.py develop
-else
-  VLLM_PRECOMPILED_WHEEL_COMMIT=$merge_base_commit VLLM_USE_PRECOMPILED=1 pip3 install -vvv -e .
-fi
-unset -v _vllm_target_lower
+VLLM_PRECOMPILED_WHEEL_COMMIT=$merge_base_commit VLLM_USE_PRECOMPILED=1 pip3 install -vvv -e .
 # Run the script
 python3 -c 'import vllm'
 

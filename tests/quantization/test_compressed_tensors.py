@@ -5,13 +5,11 @@
 Run `pytest tests/quantization/test_compressed_tensors.py`.
 """
 
-from contextlib import contextmanager
 from unittest.mock import Mock
 
 import pytest
 import torch
 from compressed_tensors.quantization import (
-    ActivationOrdering,
     QuantizationArgs,
     QuantizationStrategy,
     QuantizationType,
@@ -371,27 +369,6 @@ def test_compressed_tensors_kv_cache_fp8_per_attn_head(vllm_runner):
         assert output
 
 
-@contextmanager
-def _nvfp4_marlin_error_context(model, capfd):
-    is_rocm_and_unsupported = (
-        model == "nm-testing/TinyLlama-1.1B-Chat-v1.0-NVFP4A16"
-        and current_platform.is_rocm()
-    )
-
-    if is_rocm_and_unsupported:
-        expected_error = (
-            "ValueError: Forced NVFP4 kernel MarlinNvFp4LinearKernel is not "
-            "supported: Marlin FP4 not available"
-        )
-        with pytest.raises(RuntimeError, match="Engine core initialization failed"):
-            yield
-
-        captured = capfd.readouterr()
-        assert expected_error in captured.out + captured.err
-    else:
-        yield
-
-
 @pytest.mark.parametrize(
     "args",
     [
@@ -399,12 +376,9 @@ def _nvfp4_marlin_error_context(model, capfd):
         ("nm-testing/TinyLlama-1.1B-Chat-v1.0-NVFP4", False),
     ],
 )
-def test_compressed_tensors_nvfp4(vllm_runner, args, capfd):
+def test_compressed_tensors_nvfp4(vllm_runner, args):
     model, use_a16 = args
-    with (
-        _nvfp4_marlin_error_context(model, capfd),
-        vllm_runner(model, enforce_eager=True) as llm,
-    ):
+    with vllm_runner(model, enforce_eager=True) as llm:
 
         def check_model(model):
             layer = model.model.layers[0]
@@ -506,7 +480,6 @@ def test_compressed_tensors_fp8_block_enabled(vllm_runner):
             assert input_quant_op._forward_method in (
                 input_quant_op.forward_cuda,
                 input_quant_op.forward_hip,
-                input_quant_op.forward_xpu,
             )
 
         llm.apply_model(check_model)
@@ -707,35 +680,6 @@ def test_compressed_tensors_mxfp8_moe_setup(vllm_runner):
         llm.apply_model(check_model)
         output = llm.generate_greedy("Hello my name is", max_tokens=4)
         assert output
-
-
-@pytest.mark.parametrize(
-    "actorder,group_size,part,full,expected",
-    [
-        # actorder="group" with real grouping: must load full-K w2 scales and,
-        # when sharded (part != full), report is_k_full=False.
-        (ActivationOrdering.GROUP, 32, 64, 128, (True, 128, False)),
-        # actorder="group" but unsharded (part == full): full scales, k_full.
-        (ActivationOrdering.GROUP, 32, 128, 128, (True, 128, True)),
-        # actorder="group" with channel-wise (group_size == -1): no full load.
-        (ActivationOrdering.GROUP, -1, 64, 128, (False, 64, False)),
-        # "static"/"weight" reorder at quant time -> shard normally + k_full.
-        # Regression: static actorder under TP must keep is_k_full=True so the
-        # Marlin kernel never gets the invalid (group_size=16, is_k_full=0).
-        ("static", 32, 64, 128, (False, 64, True)),
-        ("weight", 32, 64, 128, (False, 64, True)),
-        (None, 32, 64, 128, (False, 64, True)),
-    ],
-)
-def test_wna16_marlin_moe_w2_scale_sharding(actorder, group_size, part, full, expected):
-    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_wna16_marlin import (  # noqa: E501
-        CompressedTensorsWNA16MarlinMoEMethod,
-    )
-
-    result = CompressedTensorsWNA16MarlinMoEMethod._w2_scale_sharding(
-        actorder, group_size, part, full
-    )
-    assert result == expected
 
 
 @pytest.mark.skipif(

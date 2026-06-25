@@ -270,47 +270,19 @@ class Worker(WorkerBase):
 
                 # DP_LOCAL_RANK * TP_PP_WORLD_SIZE + TP_LOCAL_RANK
                 self.local_rank += dp_local_rank * tp_pp_world_size
-
-            # Publish the logical-to-physical mapping for topology queries
-            # such as NIC affinity and P2P checks.
-            assigned_physical_gpu_ids = parallel_config.assigned_physical_gpu_ids
-            if assigned_physical_gpu_ids is not None:
-                from vllm.platforms.interface import set_assigned_physical_gpu_ids
-
-                set_assigned_physical_gpu_ids(assigned_physical_gpu_ids)
-                assert self.local_rank < len(assigned_physical_gpu_ids), (
-                    f"local_rank {self.local_rank} is out of bounds for "
-                    f"assigned_physical_gpu_ids {assigned_physical_gpu_ids}"
-                )
-                # NOTE(patch pr45026): local_world_size is derived from
-                # parallel_config.nnodes, which is only set for the "mp"
-                # multi-node backend. With the "ray"/"external_launcher"
-                # backends nnodes stays 1, so local_world_size collapses to
-                # the full world_size and this check wrongly fires on
-                # cross-node deployments. assigned_physical_gpu_ids is already
-                # per-node and the local_rank bound above fully validates the
-                # mapping for these backends, so skip the check for them.
-                if parallel_config.distributed_executor_backend not in (
-                    "ray",
-                    "external_launcher",
-                ):
-                    assert self.parallel_config.local_world_size <= len(
-                        assigned_physical_gpu_ids
-                    ), (
-                        f"local_world_size ({self.parallel_config.local_world_size})"
-                        " exceeds assigned_physical_gpu_ids count "
-                        f"({len(assigned_physical_gpu_ids)})"
-                    )
-            else:
                 assert self.local_rank < torch.accelerator.device_count(), (
-                    f"DP adjusted local rank {self.local_rank} is out of "
-                    f"bounds for {torch.accelerator.device_count()} devices."
+                    f"DP adjusted local rank {self.local_rank} is out of bounds. "
+                )
+                visible_device_count = (
+                    torch.accelerator.device_count() if torch.cuda.is_available() else 0
+                )
+                assert self.parallel_config.local_world_size <= visible_device_count, (
+                    f"local_world_size ({self.parallel_config.local_world_size}) must "
+                    f"be less than or equal to the number of visible devices "
+                    f"({visible_device_count})."
                 )
 
-            visible_device_index = (
-                current_platform.logical_device_id_to_visible_device_id(self.local_rank)
-            )
-            self.device = torch.device(f"cuda:{visible_device_index}")
+            self.device = torch.device(f"cuda:{self.local_rank}")
             torch.accelerator.set_device_index(self.device)
 
             current_platform.check_if_supports_dtype(self.model_config.dtype)
@@ -761,12 +733,11 @@ class Worker(WorkerBase):
 
         # All warmup is done — start monitoring for unexpected JIT
         # compilations that would cause latency spikes during inference.
-        from vllm.utils.jit_monitor import activate as activate_jit_monitor
-
-        activate_jit_monitor(
-            mode=self.observability_config.jit_monitor_mode,
-            verbose=self.observability_config.jit_monitor_verbose,
+        from vllm.triton_utils.jit_monitor import (
+            activate as activate_triton_jit_monitor,
         )
+
+        activate_triton_jit_monitor()
 
         # Freeze the worker heap so the GC won't scan static objects
         # (model weights, KV caches, CUDA graphs) during inference.
@@ -1184,14 +1155,6 @@ class Worker(WorkerBase):
         if model_runner := getattr(self, "model_runner", None):
             model_runner.shutdown()
 
-        # Release kept-alive cumem pools while the pluggable allocator wrappers
-        # and callbacks are still alive, so MemPool teardown is not deferred to
-        # interpreter finalization (pytorch/pytorch#145168).
-        from vllm.device_allocator.cumem import CuMemAllocator
-
-        if CuMemAllocator.instance is not None:
-            CuMemAllocator.instance.release_pools()
-
     def elastic_ep_execute(self, execute_method: str, *args, **kwargs):
         return self.elastic_ep_executor.execute(execute_method, *args, **kwargs)
 
@@ -1235,6 +1198,25 @@ def init_worker_distributed_environment(
         parallel_config.prefill_context_parallel_size,
         parallel_config.decode_context_parallel_size,
     )
+
+    # Heterogeneous TP: publish the per-rank column/row partition sizes so
+    # ``tensor_model_parallel_all_gather`` (in ``distributed.communication_op``)
+    # can route unequal shards through the pad-gather-slice path. We default
+    # to the model's hidden size because ColumnParallel / RowParallel layers
+    # share that dim across the model; intermediate-size layers reuse the
+    # ``PartitionConfig.tp_partition_sizes`` API directly when they need
+    # different per-rank widths.
+    if parallel_config.tensor_parallel_weights is not None:
+        from vllm.distributed import set_tp_partition_sizes
+
+        model_config = vllm_config.model_config
+        hidden_size = (
+            getattr(model_config.hf_config, "hidden_size", None)
+            if model_config is not None and model_config.hf_config is not None
+            else None
+        )
+        if hidden_size is not None:
+            set_tp_partition_sizes(parallel_config.tp_partition_sizes(hidden_size))
 
     # Init ec connector here before KV caches init
     # NOTE: We do not init KV caches for Encoder-only instance in EPD disagg mode

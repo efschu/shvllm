@@ -261,20 +261,12 @@ async def test_build_transfer_params_multi_group_trimming(monkeypatch):
 
         local_regions = [
             TransferRegion(
-                layer_name="model.layers.0.self_attn",
-                layer_index=0,
-                base_addr=0x1000,
-                block_len=block_len,
-                kv_block_len=block_len,
+                base_addr=0x1000, block_len=block_len, kv_block_len=block_len
             ),
         ]
         remote_regions = [
             TransferRegion(
-                layer_name="model.layers.0.self_attn",
-                layer_index=0,
-                base_addr=0x2000,
-                block_len=block_len,
-                kv_block_len=block_len,
+                base_addr=0x2000, block_len=block_len, kv_block_len=block_len
             ),
         ]
 
@@ -352,20 +344,12 @@ async def test_build_transfer_params_group_count_mismatch(monkeypatch):
 
         local_regions = [
             TransferRegion(
-                layer_name="model.layers.0.self_attn",
-                layer_index=0,
-                base_addr=0x1000,
-                block_len=block_len,
-                kv_block_len=block_len,
+                base_addr=0x1000, block_len=block_len, kv_block_len=block_len
             ),
         ]
         remote_regions = [
             TransferRegion(
-                layer_name="model.layers.0.self_attn",
-                layer_index=0,
-                base_addr=0x2000,
-                block_len=block_len,
-                kv_block_len=block_len,
+                base_addr=0x2000, block_len=block_len, kv_block_len=block_len
             ),
         ]
 

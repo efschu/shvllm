@@ -4,7 +4,6 @@ import argparse
 
 from vllm.benchmarks.sweep.cli import add_cli_args, main
 from vllm.entrypoints.cli.benchmark.base import BenchmarkSubcommandBase
-from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 
 class BenchmarkSweepSubcommand(BenchmarkSubcommandBase):
@@ -14,7 +13,7 @@ class BenchmarkSweepSubcommand(BenchmarkSubcommandBase):
     help = "Benchmark for a parameter sweep."
 
     @classmethod
-    def add_cli_args(cls, parser: FlexibleArgumentParser) -> None:
+    def add_cli_args(cls, parser: argparse.ArgumentParser) -> None:
         add_cli_args(parser)
 
     @staticmethod

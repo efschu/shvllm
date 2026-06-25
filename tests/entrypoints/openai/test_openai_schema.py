@@ -6,21 +6,14 @@ from typing import Final
 import pytest
 import schemathesis
 from hypothesis import HealthCheck, settings
-from schemathesis import GenerationMode
-from schemathesis.config import (
-    ChecksConfig,
-    CoveragePhaseConfig,
-    GenerationConfig,
-    PhasesConfig,
-    PositiveDataAcceptanceConfig,
-    ProjectConfig,
-    ProjectsConfig,
-    SchemathesisConfig,
-)
+from schemathesis import GenerationConfig
+from schemathesis.models import Case
 
 from vllm.platforms import current_platform
 
 from ...utils import RemoteOpenAIServer
+
+schemathesis.experimental.OPEN_API_3_1.enable()
 
 MODEL_NAME = "HuggingFaceTB/SmolVLM-256M-Instruct"
 MAXIMUM_IMAGES = 2
@@ -51,38 +44,21 @@ def server():
 @pytest.fixture(scope="module")
 def get_schema(server):
     # avoid generating null (\x00) bytes in strings during test case generation
-    return schemathesis.openapi.from_url(
+    return schemathesis.openapi.from_uri(
         f"{server.url_root}/openapi.json",
-        config=SchemathesisConfig(
-            projects=ProjectsConfig(
-                default=ProjectConfig(
-                    generation=GenerationConfig(
-                        allow_x00=False,
-                        modes=[GenerationMode.POSITIVE],
-                    ),
-                    checks=ChecksConfig(
-                        positive_data_acceptance=PositiveDataAcceptanceConfig(
-                            enabled=False,
-                        ),
-                    ),
-                    phases=PhasesConfig(
-                        coverage=CoveragePhaseConfig(enabled=False),
-                    ),
-                ),
-            ),
-        ),
+        generation_config=GenerationConfig(allow_x00=False),
     )
 
 
-schema = schemathesis.pytest.from_fixture("get_schema")
+schema = schemathesis.from_pytest_fixture("get_schema")
 
 
 @schemathesis.hook
-def before_generate_case(context: schemathesis.HookContext, strategy):
+def before_generate_case(context: schemathesis.hooks.HookContext, strategy):
     op = context.operation
     assert op is not None
 
-    def no_invalid_types(case: schemathesis.Case):
+    def no_invalid_types(case: schemathesis.models.Case):
         """
         Skips tool_calls with `"type": "custom"` which schemathesis incorrectly
         generates instead of the valid `"type": "function"`.
@@ -92,25 +68,39 @@ def before_generate_case(context: schemathesis.HookContext, strategy):
             -d '{"messages": [{"role": "assistant", "tool_calls": [{"custom": {"input": "", "name": ""}, "id": "", "type": "custom"}]}]}' \
             http://localhost:8000/v1/chat/completions
         """  # noqa: E501
-        if (
-            hasattr(case, "body")
-            and isinstance(case.body, dict)
-            and "messages" in case.body
-            and isinstance(case.body["messages"], list)
-            and len(case.body["messages"]) > 0
-        ):
-            for message in case.body["messages"]:
-                if not isinstance(message, dict):
-                    continue
+        if hasattr(case, "body") and isinstance(case.body, dict):
+            if (
+                "messages" in case.body
+                and isinstance(case.body["messages"], list)
+                and len(case.body["messages"]) > 0
+            ):
+                for message in case.body["messages"]:
+                    if not isinstance(message, dict):
+                        continue
 
-                tool_calls = message.get("tool_calls", [])
-                if isinstance(tool_calls, list):
-                    for tool_call in tool_calls:
-                        if isinstance(tool_call, dict):
-                            if tool_call.get("type") != "function":
-                                return False
-                            if "custom" in tool_call:
-                                return False
+                    tool_calls = message.get("tool_calls", [])
+                    if isinstance(tool_calls, list):
+                        for tool_call in tool_calls:
+                            if isinstance(tool_call, dict):
+                                if tool_call.get("type") != "function":
+                                    return False
+                                if "custom" in tool_call:
+                                    return False
+
+            # Sometimes structured_outputs.grammar is generated to be empty
+            # Causing a server error in EBNF grammar parsing
+            # https://github.com/vllm-project/vllm/pull/22587#issuecomment-3195253421
+            structured_outputs = case.body.get("structured_outputs", {})
+            grammar = (
+                structured_outputs.get("grammar")
+                if isinstance(structured_outputs, dict)
+                else None
+            )
+
+            if grammar == "":
+                # Allow None (will be handled as no grammar)
+                # But skip empty strings
+                return False
 
         return True
 
@@ -118,6 +108,7 @@ def before_generate_case(context: schemathesis.HookContext, strategy):
 
 
 @schema.parametrize()
+@schema.override(headers={"Content-Type": "application/json"})
 @settings(
     deadline=LONG_TIMEOUT_SECONDS * 1000,
     max_examples=50,
@@ -131,7 +122,7 @@ def before_generate_case(context: schemathesis.HookContext, strategy):
     # generating large-but-valid request bodies before vLLM is called.
     suppress_health_check=[HealthCheck.filter_too_much, HealthCheck.data_too_large],
 )
-def test_openapi_stateless(case: schemathesis.Case):
+def test_openapi_stateless(case: Case):
     key = (
         case.operation.method.upper(),
         case.operation.path,
@@ -160,8 +151,4 @@ def test_openapi_stateless(case: schemathesis.Case):
     }.get(key, DEFAULT_TIMEOUT_SECONDS)
 
     # No need to verify SSL certificate for localhost
-    case.call_and_validate(
-        verify=False,
-        timeout=timeout,
-        headers={"Content-Type": "application/json"},
-    )
+    case.call_and_validate(verify=False, timeout=timeout)

@@ -19,7 +19,6 @@ def _prepare_megamoe_inputs_kernel(
     x_sf,
     topk_ids,
     topk_weights,
-    is_padding,
     topk_idx_out,
     topk_weights_out,
     hidden_stride_m: tl.constexpr,
@@ -32,7 +31,6 @@ def _prepare_megamoe_inputs_kernel(
     topk_ids_stride_k: tl.constexpr,
     topk_weights_stride_m: tl.constexpr,
     topk_weights_stride_k: tl.constexpr,
-    is_padding_stride_m: tl.constexpr,
     topk_idx_stride_m: tl.constexpr,
     topk_idx_stride_k: tl.constexpr,
     topk_weights_out_stride_m: tl.constexpr,
@@ -87,16 +85,12 @@ def _prepare_megamoe_inputs_kernel(
     if k_block_id == 0:
         topk_offsets = tl.arange(0, BLOCK_TOPK)
         topk_mask = topk_offsets < top_k
-        token_is_padding = False
-        if is_padding is not None:
-            token_is_padding = tl.load(is_padding + token_id * is_padding_stride_m)
 
         ids = tl.load(
             topk_ids + token_id * topk_ids_stride_m + topk_offsets * topk_ids_stride_k,
             mask=topk_mask,
             other=0,
         ).to(tl.int64)
-        ids = tl.where(token_is_padding, -1, ids)
         tl.store(
             topk_idx_out
             + token_id * topk_idx_stride_m
@@ -112,7 +106,6 @@ def _prepare_megamoe_inputs_kernel(
             mask=topk_mask,
             other=0.0,
         )
-        weights = tl.where(token_is_padding, 0.0, weights)
         tl.store(
             topk_weights_out
             + token_id * topk_weights_out_stride_m
@@ -130,7 +123,6 @@ def prepare_megamoe_inputs(
     x_sf: torch.Tensor,
     topk_idx_out: torch.Tensor,
     topk_weights_out: torch.Tensor,
-    is_padding: torch.Tensor | None = None,
 ) -> None:
     num_tokens, hidden_size = hidden_states.shape
     if num_tokens == 0:
@@ -150,14 +142,12 @@ def prepare_megamoe_inputs(
     block_k = 128
     grid = (num_tokens, triton.cdiv(hidden_size, block_k))
     block_topk = triton.next_power_of_2(top_k)
-    padding_stride_m = is_padding.stride(0) if is_padding is not None else 0
     _prepare_megamoe_inputs_kernel[grid](
         hidden_states,
         x_fp8,
         x_sf,
         topk_ids,
         topk_weights,
-        is_padding,
         topk_idx_out,
         topk_weights_out,
         hidden_states.stride(0),
@@ -170,7 +160,6 @@ def prepare_megamoe_inputs(
         topk_ids.stride(1),
         topk_weights.stride(0),
         topk_weights.stride(1),
-        padding_stride_m,
         topk_idx_out.stride(0),
         topk_idx_out.stride(1),
         topk_weights_out.stride(0),

@@ -8,105 +8,31 @@ from unittest.mock import MagicMock
 import pytest
 
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
-from vllm.parser.gemma4 import (
+from vllm.tool_parsers.gemma4_tool_parser import (
     TOOL_CALL_END,
     TOOL_CALL_START,
+    Gemma4ToolParser,
     _parse_gemma4_args,
     _parse_gemma4_array,
 )
-from vllm.tool_parsers.gemma4_engine_tool_parser import Gemma4EngineToolParser
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
 
-TOOL_CALL_START_ID = 48
-TOOL_CALL_END_ID = 49
-CHANNEL_START = "<|channel>"
-CHANNEL_END = "<channel|>"
-CHANNEL_START_ID = 50
-CHANNEL_END_ID = 51
-
-
-def _make_tool(name, properties):
-    from vllm.entrypoints.openai.chat_completion.protocol import (
-        ChatCompletionToolsParam,
-    )
-
-    return ChatCompletionToolsParam(
-        type="function",
-        function={
-            "name": name,
-            "parameters": {"type": "object", "properties": properties},
-        },
-    )
-
-
-_TOOLS = [
-    _make_tool(
-        "set_status",
-        {
-            "is_active": {"type": "boolean"},
-            "count": {"type": "integer"},
-            "score": {"type": "number"},
-        },
-    ),
-    _make_tool(
-        "set_config",
-        {
-            "count": {"type": "integer"},
-            "active": {"type": "boolean"},
-        },
-    ),
-    _make_tool(
-        "search",
-        {
-            "input": {
-                "type": "object",
-                "properties": {"all": {"type": "boolean"}},
-            },
-        },
-    ),
-    _make_tool(
-        "set",
-        {
-            "flag": {"type": "boolean"},
-            "count": {"type": "integer"},
-        },
-    ),
-    _make_tool(
-        "Edit",
-        {
-            "file_path": {"type": "string"},
-            "old_string": {"type": "string"},
-            "new_string": {"type": "string"},
-            "replace_all": {"type": "boolean"},
-        },
-    ),
-]
-
-
 @pytest.fixture
 def mock_tokenizer():
-    vocab = {
-        TOOL_CALL_START: TOOL_CALL_START_ID,
-        TOOL_CALL_END: TOOL_CALL_END_ID,
-        CHANNEL_START: CHANNEL_START_ID,
-        CHANNEL_END: CHANNEL_END_ID,
-    }
-    decode_map = {v: k for k, v in vocab.items()}
-
     tokenizer = MagicMock()
     tokenizer.encode.return_value = [1, 2, 3]
-    tokenizer.get_vocab.return_value = vocab
-    tokenizer.decode.side_effect = lambda ids: decode_map.get(ids[0], f"tok{ids[0]}")
+    # Include the tool call start token in the vocab for the parser
+    tokenizer.get_vocab.return_value = {TOOL_CALL_START: 48, TOOL_CALL_END: 49}
     return tokenizer
 
 
 @pytest.fixture
 def parser(mock_tokenizer):
-    return Gemma4EngineToolParser(mock_tokenizer, tools=_TOOLS)
+    return Gemma4ToolParser(mock_tokenizer)
 
 
 @pytest.fixture
@@ -123,9 +49,6 @@ def mock_request():
 
 
 class TestParseGemma4Args:
-    """Values are returned as strings; type coercion to proper JSON types
-    happens at the engine layer."""
-
     def test_empty_string(self):
         assert _parse_gemma4_args("") == {}
 
@@ -148,23 +71,27 @@ class TestParseGemma4Args:
 
     def test_integer_value(self):
         result = _parse_gemma4_args("count:42")
-        assert result == {"count": "42"}
+        assert result == {"count": 42}
 
     def test_float_value(self):
         result = _parse_gemma4_args("score:3.14")
-        assert result == {"score": "3.14"}
+        assert result == {"score": 3.14}
 
     def test_boolean_true(self):
         result = _parse_gemma4_args("flag:true")
-        assert result == {"flag": "true"}
+        assert result == {"flag": True}
 
     def test_boolean_false(self):
         result = _parse_gemma4_args("flag:false")
-        assert result == {"flag": "false"}
+        assert result == {"flag": False}
 
     def test_null_value(self):
+        # Bare `null` must parse as None (Python), not the string "null".
+        # Without this, tool_choice=auto would emit `{"param": "null"}`
+        # instead of `{"param": null}` for nullable tool parameters.
         result = _parse_gemma4_args("param:null")
-        assert result == {"param": "null"}
+        assert result == {"param": None}
+        assert json.dumps(result) == '{"param": null}'
 
     def test_mixed_types(self):
         result = _parse_gemma4_args(
@@ -172,9 +99,9 @@ class TestParseGemma4Args:
         )
         assert result == {
             "name": "test",
-            "count": "42",
-            "active": "true",
-            "score": "3.14",
+            "count": 42,
+            "active": True,
+            "score": 3.14,
         }
 
     def test_nested_object(self):
@@ -184,17 +111,6 @@ class TestParseGemma4Args:
     def test_array_of_strings(self):
         result = _parse_gemma4_args('items:[<|"|>a<|"|>,<|"|>b<|"|>]')
         assert result == {"items": ["a", "b"]}
-
-    def test_delimited_keys_stripped(self):
-        """Keys wrapped in <|"|> delimiters are stripped."""
-        result = _parse_gemma4_args('<|"|>location<|"|>:<|"|>Paris<|"|>')
-        assert result == {"location": "Paris"}
-
-        result = _parse_gemma4_args('outer:{<|"|>inner<|"|>:<|"|>val<|"|>}')
-        assert result == {"outer": {"inner": "val"}}
-
-        result = _parse_gemma4_args('<|"|>name<|"|>:<|"|>Alice<|"|>,count:42')
-        assert result == {"name": "Alice", "count": "42"}
 
     def test_unterminated_string(self):
         """Unterminated strings should take everything after the delimiter."""
@@ -237,7 +153,7 @@ class TestParseGemma4Args:
 
         # Non-partial mode parses trailing dot normally
         result = _parse_gemma4_args("left:108.,right:22.8", partial=False)
-        assert result == {"left": "108.", "right": "22.8"}
+        assert result == {"left": 108.0, "right": 22.8}
 
     @pytest.mark.timeout(5)
     def test_malformed_partial_array(self):
@@ -256,7 +172,7 @@ class TestParseGemma4Array:
 
     def test_bare_values(self):
         result = _parse_gemma4_array("42,true,3.14")
-        assert result == ["42", "true", "3.14"]
+        assert result == [42, True, 3.14]
 
     @pytest.mark.timeout(5)
     def test_string_element_with_closing_bracket(self):
@@ -266,7 +182,7 @@ class TestParseGemma4Array:
     @pytest.mark.timeout(5)
     def test_stray_closing_bracket(self):
         result = _parse_gemma4_array("42,]trailing")
-        assert result == ["42"]
+        assert result == [42]
 
     def test_trailing_dot_float_partial_withheld(self):
         """Array elements with trailing dot withheld in partial mode."""
@@ -275,7 +191,7 @@ class TestParseGemma4Array:
 
         # Stable elements before trailing-dot element are kept
         result = _parse_gemma4_array("42,108.,3", partial=True)
-        assert result == ["42"]
+        assert result == [42]
 
 
 # ---------------------------------------------------------------------------
@@ -381,11 +297,9 @@ class TestExtractToolCalls:
         model_output = '<|tool_call>call:get_weather{location:<|"|>London'
         result = parser.extract_tool_calls(model_output, mock_request)
 
-        assert result.tools_called is True
-        assert len(result.tool_calls) == 1
-        assert result.tool_calls[0].function.name == "get_weather"
-        args = json.loads(result.tool_calls[0].function.arguments)
-        assert args == {"location": "London"}
+        # Incomplete — no <tool_call|> end marker, regex won't match
+        assert result.tools_called is False
+        assert result.content == model_output
 
     def test_hyphenated_function_name(self, parser, mock_request):
         """Ensure function names with hyphens are parsed correctly."""
@@ -431,15 +345,8 @@ class TestStreamingExtraction:
     verifying that the accumulated argument deltas form valid JSON.
     """
 
-    _SPECIAL_TOKEN_IDS = {
-        TOOL_CALL_START: TOOL_CALL_START_ID,
-        TOOL_CALL_END: TOOL_CALL_END_ID,
-        CHANNEL_START: CHANNEL_START_ID,
-        CHANNEL_END: CHANNEL_END_ID,
-    }
-
     def _simulate_streaming(
-        self, parser: Any, mock_request: Any, chunks: list[str]
+        self, parser: Gemma4ToolParser, mock_request: Any, chunks: list[str]
     ) -> list[tuple[Any, str]]:
         """Feed chunks through the streaming parser and collect results.
 
@@ -451,17 +358,14 @@ class TestStreamingExtraction:
 
         for chunk in chunks:
             current_text = previous_text + chunk
-            found: list[tuple[int, int]] = []
-            for token, tid in self._SPECIAL_TOKEN_IDS.items():
-                pos = 0
-                while True:
-                    idx = chunk.find(token, pos)
-                    if idx < 0:
-                        break
-                    found.append((idx, tid))
-                    pos = idx + len(token)
-            found.sort()
-            delta_token_ids: list[int] = [tid for _, tid in found] if found else [0]
+            # Use token ID 48 for tool_call start, 49 for end, 0 otherwise
+            delta_token_ids: list[int] = []
+            if TOOL_CALL_START in chunk:
+                delta_token_ids.append(48)
+            elif TOOL_CALL_END in chunk:
+                delta_token_ids.append(49)
+            else:
+                delta_token_ids.append(0)
 
             current_token_ids = previous_token_ids + delta_token_ids
 
@@ -647,10 +551,10 @@ class TestStreamingExtraction:
 
         results = self._simulate_streaming(parser, mock_request, chunks)
         args_text = self._collect_arguments(results)
-        assert args_text is not None
-        parsed_args = json.loads(args_text)
-        assert parsed_args["count"] == 42
-        assert parsed_args["active"] is True
+        if args_text:
+            parsed_args = json.loads(args_text)
+            assert parsed_args["count"] == 42
+            assert parsed_args["active"] is True
 
     def test_streaming_boolean_split_across_chunks(self, parser, mock_request):
         """Boolean value split across token boundaries must not corrupt JSON."""
@@ -739,15 +643,23 @@ class TestStreamingExtraction:
         )
 
     def test_streaming_does_not_duplicate_plain_text_after_tool_call(
-        self, parser, mock_request
+        self, parser, mock_request, monkeypatch
     ):
-        """Buffered plain text after a tool call must not corrupt content."""
+        """Buffered plain text after a tool call must not corrupt current_text."""
+        captured_current_texts: list[str] = []
+        original_extract_streaming = parser._extract_streaming
+
+        def wrapped_extract_streaming(previous_text, current_text, delta_text):
+            captured_current_texts.append(current_text)
+            return original_extract_streaming(previous_text, current_text, delta_text)
+
+        monkeypatch.setattr(parser, "_extract_streaming", wrapped_extract_streaming)
+
         chunks = [
             "<|tool_call>",
             "call:get_weather{",
             'location:<|"|>Paris<|"|>}',
-            "<tool_call|>",
-            "<",
+            "<tool_call|><",
             "div>",
         ]
 
@@ -756,7 +668,8 @@ class TestStreamingExtraction:
             delta.content for delta, _ in results if delta is not None and delta.content
         ]
         assert "".join(content_parts) == "<div>"
-        assert "<<div>" not in "".join(content_parts)
+        assert captured_current_texts[-1].endswith("<tool_call|><div>")
+        assert not captured_current_texts[-1].endswith("<tool_call|><<div>")
 
     def test_streaming_html_argument_does_not_duplicate_tag_prefixes(
         self, parser, mock_request

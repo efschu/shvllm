@@ -61,7 +61,6 @@ def _create_workspace(
             hidden_dim=hidden_dim,
             dtype=dtype,
             comm_backend=comm_backend,
-            group=group,
         )
     except Exception as e:
         if "multicast" in str(e).lower():

@@ -107,15 +107,12 @@ if TYPE_CHECKING:
     VLLM_FORCE_AOT_LOAD: bool = False
     VLLM_USE_MEGA_AOT_ARTIFACT: bool = False
     VLLM_USE_TRITON_AWQ: bool = False
-    VLLM_FASTSAFETENSORS_QUEUE_SIZE: int = 0
-    VLLM_TRITON_FORCE_FIRST_CONFIG: bool = False
     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
     VLLM_SKIP_P2P_CHECK: bool = False
     VLLM_DISABLED_KERNELS: list[str] = []
     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
-    VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
     VLLM_ROCM_USE_AITER: bool = False
     VLLM_ROCM_USE_AITER_PAGED_ATTN: bool = False
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
@@ -185,14 +182,12 @@ if TYPE_CHECKING:
         "relax",
     ] = "relax"
     VLLM_USE_FUSED_MOE_GROUPED_TOPK: bool = True
-    VLLM_MOE_SKIP_PADDING: bool = False
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_XGRAMMAR_CACHE_MB: int = 0
-    VLLM_REGEX_COMPILATION_TIMEOUT_S: int = 5
     VLLM_MSGPACK_ZERO_COPY_THRESHOLD: int = 256
     VLLM_ALLOW_INSECURE_SERIALIZATION: bool = False
     VLLM_DISABLE_REQUEST_ID_RANDOMIZATION: bool = False
@@ -208,9 +203,7 @@ if TYPE_CHECKING:
     VLLM_ENFORCE_STRICT_TOOL_CALLING: bool = True
     VLLM_MQ_MAX_CHUNK_BYTES_MB: int = 16
     VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: int = 300
-    VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS: int = 5
     VLLM_KV_CACHE_LAYOUT: Literal["NHD", "HND"] | None = None
-    VLLM_USE_PACKED_HMA_KV_CACHE: bool = False
     VLLM_SSM_CONV_STATE_LAYOUT: Literal["SD", "DS"] | None = None
     VLLM_COMPUTE_NANS_IN_LOGITS: bool = False
     VLLM_ROCM_QUICK_REDUCE_QUANTIZATION: Literal[
@@ -263,7 +256,6 @@ if TYPE_CHECKING:
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
-    VLLM_WSL2_ENABLE_PIN_MEMORY: bool = False
     VLLM_DISABLE_LOG_LOGO: bool = False
     VLLM_LORA_DISABLE_PDL: bool = False
     VLLM_ENABLE_CUDA_COMPATIBILITY: bool = False
@@ -487,7 +479,7 @@ def get_vllm_port() -> int | None:
             raise ValueError(
                 f"VLLM_PORT '{port}' appears to be a URI. "
                 "This may be caused by a Kubernetes service discovery issue,"
-                "check the warning in: https://docs.vllm.ai/en/latest/configuration/env_vars.html"
+                "check the warning in: https://docs.vllm.ai/en/stable/serving/env_vars.html"
             ) from None
         raise ValueError(f"VLLM_PORT '{port}' must be a valid integer") from err
 
@@ -1019,18 +1011,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TEST_FORCE_LOAD_FORMAT": lambda: os.getenv(
         "VLLM_TEST_FORCE_LOAD_FORMAT", "dummy"
     ),
-    # Queue size for fastsafetensors ParallelLoader pipelined weight
-    # loading. Peak load-time VRAM is roughly
-    # model_weights + (1 + queue_size) * shard_size.
-    # Default 0 preserves the non-pipelined memory footprint so this
-    # change does not shrink the loadable-model envelope. Set to 1
-    # (or higher) to overlap producing the next shard's device buffer
-    # with the consumer copying the current shard into model params,
-    # at the cost of `queue_size` extra shard-sized buffers resident
-    # at peak during loading.
-    "VLLM_FASTSAFETENSORS_QUEUE_SIZE": lambda: int(
-        os.getenv("VLLM_FASTSAFETENSORS_QUEUE_SIZE", "0")
-    ),
     # Timeout in seconds for keeping HTTP connections alive in API server
     "VLLM_HTTP_TIMEOUT_KEEP_ALIVE": lambda: int(
         os.environ.get("VLLM_HTTP_TIMEOUT_KEEP_ALIVE", "5")
@@ -1075,14 +1055,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # If set, vLLM will use Triton implementations of AWQ.
     "VLLM_USE_TRITON_AWQ": lambda: bool(int(os.getenv("VLLM_USE_TRITON_AWQ", "0"))),
-    # If set, monkey-patch triton.runtime.autotuner.Autotuner.run to skip
-    # benchmarking and select the first valid config (walking past invalid
-    # ones). Used to eliminate autotuning variability when measuring kernel
-    # performance and applied before running any kernel.
-    "VLLM_TRITON_FORCE_FIRST_CONFIG": lambda: (
-        os.environ.get("VLLM_TRITON_FORCE_FIRST_CONFIG", "0").strip().lower()
-        in ("1", "true")
-    ),
     # If set, allow loading or unloading lora adapters in runtime,
     "VLLM_ALLOW_RUNTIME_LORA_UPDATING": lambda: (
         os.environ.get("VLLM_ALLOW_RUNTIME_LORA_UPDATING", "0").strip().lower()
@@ -1118,15 +1090,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Disable aiter ops unless specifically enabled.
     # Acts as a parent switch to enable the rest of the other operations.
-    # On hardware without a native MXFP8 kernel (e.g. ROCm gfx942 / MI300), the
-    # MXFP8 emulation path dequantizes weights MXFP8->BF16 once at load time and
-    # runs as a BF16 checkpoint (no per-step dequant). Set to 0 to fall back to
-    # per-step dequant: keeps the 1-byte MXFP8 weights (~half the weight memory)
-    # at the cost of dequantizing every forward step (much slower). Default on.
-    "VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD": lambda: (
-        os.getenv("VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD", "True").lower()
-        in ("true", "1")
-    ),
     "VLLM_ROCM_USE_AITER": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER", "False").lower() in ("true", "1")
     ),
@@ -1470,11 +1433,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_FUSED_MOE_GROUPED_TOPK": lambda: bool(
         int(os.getenv("VLLM_USE_FUSED_MOE_GROUPED_TOPK", "1"))
     ),
-    # Skip cudagraph/DP padding tokens in the MoE path by forcing their expert
-    # ids to -1 so the dispatch and experts drop them. Requires a MoE kernel that
-    # treats topk_id == -1 as a skip sentinel; off by default because not all
-    # kernels support it yet.
-    "VLLM_MOE_SKIP_PADDING": lambda: bool(int(os.getenv("VLLM_MOE_SKIP_PADDING", "0"))),
     # Allow use of FlashInfer FP8 block-scale GEMM for linear layers.
     # This uses TensorRT-LLM kernels and requires SM90+ (Hopper).
     "VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER": lambda: bool(
@@ -1488,13 +1446,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # of 512 MB should be enough for roughly 1000 JSON schemas.
     # It can be changed with this variable if needed for some reason.
     "VLLM_XGRAMMAR_CACHE_MB": lambda: int(os.getenv("VLLM_XGRAMMAR_CACHE_MB", "512")),
-    # Maximum time in seconds allowed for regex compilation in structured
-    # output backends (xgrammar, outlines). Prevents ReDoS attacks where
-    # adversarial patterns cause exponential DFA state-space explosion.
-    # Set to 0 to disable the timeout (not recommended in production).
-    "VLLM_REGEX_COMPILATION_TIMEOUT_S": lambda: int(
-        os.getenv("VLLM_REGEX_COMPILATION_TIMEOUT_S", "5")
-    ),
     # Control the threshold for msgspec to use 'zero copy' for
     # serialization/deserialization of tensors. Tensors below
     # this limit will be encoded into the msgpack buffer, and
@@ -1586,9 +1537,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS", "1")
     ),
     # Enforce function parameter schemas in structural-tag based tool calling.
-    "VLLM_ENFORCE_STRICT_TOOL_CALLING": lambda: (
-        os.getenv("VLLM_ENFORCE_STRICT_TOOL_CALLING", "True").lower() in ("true", "1")
-    ),
+    "VLLM_ENFORCE_STRICT_TOOL_CALLING": lambda: os.getenv(
+        "VLLM_ENFORCE_STRICT_TOOL_CALLING", "True"
+    ).lower()
+    in ("true", "1"),
     # Control the max chunk bytes (in MB) for the rpc message queue.
     # Object larger than this threshold will be broadcast to worker
     # processes via zmq.
@@ -1600,10 +1552,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS": lambda: int(
         os.getenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "300")
     ),
-    # Timeout in seconds for engine and worker process shutdown
-    "VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS": lambda: int(
-        os.getenv("VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS", "5")
-    ),
     # KV Cache layout used throughout vllm.
     # Some common values are:
     # - NHD
@@ -1613,11 +1561,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # implement and support a subset of all possible layouts.
     "VLLM_KV_CACHE_LAYOUT": env_with_choices(
         "VLLM_KV_CACHE_LAYOUT", None, ["NHD", "HND"]
-    ),
-    # Opt into packed per-block KV cache allocation for multi-group
-    # attention-only HMA models (e.g. gpt-oss, Gemma 3/4).
-    "VLLM_USE_PACKED_HMA_KV_CACHE": lambda: bool(
-        int(os.getenv("VLLM_USE_PACKED_HMA_KV_CACHE", "0"))
     ),
     # SSM conv state layout used for Mamba models.
     # - SD: (state_len, dim) — dim contiguous (default)
@@ -1860,13 +1803,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_WEIGHT_OFFLOADING_DISABLE_UVA": lambda: bool(
         int(os.getenv("VLLM_WEIGHT_OFFLOADING_DISABLE_UVA", "0"))
     ),
-    # On WSL2 with a compatible kernel (>= 4.19.121), pinned memory is
-    # supported but disabled by default due to a small performance regression.
-    # Set to 1 when pinned memory or UVA is required (e.g. CPU offloading
-    # or v2 model runner).
-    "VLLM_WSL2_ENABLE_PIN_MEMORY": lambda: bool(
-        int(os.getenv("VLLM_WSL2_ENABLE_PIN_MEMORY", "0"))
-    ),
     # Disable logging of vLLM logo at server startup time.
     "VLLM_DISABLE_LOG_LOGO": lambda: bool(int(os.getenv("VLLM_DISABLE_LOG_LOGO", "0"))),
     # Disable PDL for LoRA, as enabling PDL with LoRA on SM100 causes
@@ -2058,7 +1994,6 @@ def compile_factors() -> dict[str, object]:
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",
         "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS",
-        "VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS",
         "VLLM_KEEP_ALIVE_ON_ENGINE_DEATH",
         "VLLM_IMAGE_FETCH_TIMEOUT",
         "VLLM_VIDEO_FETCH_TIMEOUT",

@@ -4,7 +4,6 @@ import argparse
 
 from vllm.benchmarks.startup import add_cli_args, main
 from vllm.entrypoints.cli.benchmark.base import BenchmarkSubcommandBase
-from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 
 class BenchmarkStartupSubcommand(BenchmarkSubcommandBase):
@@ -14,7 +13,7 @@ class BenchmarkStartupSubcommand(BenchmarkSubcommandBase):
     help = "Benchmark the startup time of vLLM models."
 
     @classmethod
-    def add_cli_args(cls, parser: FlexibleArgumentParser) -> None:
+    def add_cli_args(cls, parser: argparse.ArgumentParser) -> None:
         add_cli_args(parser)
 
     @staticmethod

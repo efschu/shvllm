@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
 
 import vllm.envs as envs
-from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, get_current_vllm_config
 from vllm.config.vllm import VllmConfig
 from vllm.forward_context import ForwardContext, get_forward_context
@@ -166,21 +165,7 @@ def _init_kv_cache_quant(
         # TODO (mgoin): kv cache dtype should be specified in the FP8
         # checkpoint config and become the "auto" behavior
         if layer.kv_cache_dtype == "fp8_e5m2":
-            # A compressed-tensors checkpoint stores fp8 KV scales only when it
-            # declares a kv_cache_scheme; weight-only ones declare none and must
-            # keep fp8_e5m2, the only fp8 KV dtype usable on Ampere.
-            from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
-                CompressedTensorsConfig,
-                CompressedTensorsKVCacheMethod,
-            )
-
-            if not isinstance(quant_method, CompressedTensorsKVCacheMethod) or (
-                cast(CompressedTensorsConfig, quant_method.quant_config).kv_cache_scheme
-                is not None
-            ):
-                raise ValueError(
-                    "fp8_e5m2 kv-cache is not supported with fp8 checkpoints."
-                )
+            raise ValueError("fp8_e5m2 kv-cache is not supported with fp8 checkpoints.")
         # If quantization is enabled, we make "k_scale" and "v_scale"
         # parameters so that it can be loaded from the model checkpoint.
         # The k/v_scale will then be converted back to native float32
@@ -581,14 +566,7 @@ class Attention(nn.Module, AttentionLayerBase):
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
         # Block size may get updated after model loading, refresh it
         block_size = vllm_config.cache_config.block_size
-        # Encoder-only attention is prefill-only and keeps no autoregressive KV
-        # cache. In hybrid models (e.g. Qwen3.5 / ColQwen3.5: GatedDeltaNet
-        # linear_attention interleaved with full_attention) the runner iterates
-        # every attention module to build the KV-cache spec, so an ENCODER_ONLY
-        # full_attention layer reaches here; it contributes no KV cache group.
-        if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
-            return None
-        # Should not be called for enc-dec attention.
+        # Should not be called for enc-dec or encoder-only attention.
         assert self.attn_type == AttentionType.DECODER
         quant_mode = get_kv_quant_mode(self.kv_cache_dtype)
         if self.sliding_window is not None:
@@ -752,7 +730,6 @@ direct_register_custom_op(
 )
 
 
-@eager_break_during_capture
 @maybe_transfer_kv_layer
 def unified_attention_with_output(
     query: torch.Tensor,

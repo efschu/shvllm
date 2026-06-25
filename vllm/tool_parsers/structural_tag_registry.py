@@ -1,14 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Callable, Sequence
-from typing import Any, Literal, TypeAlias
+from collections.abc import Callable
+from typing import Any, Literal
 
-from openai.types.responses import FunctionTool
-from openai.types.responses.response import ToolChoice as ResponsesToolChoice
-from openai.types.responses.tool import Tool as ResponsesTool
-from openai.types.responses.tool_choice_allowed import ToolChoiceAllowed
-from openai.types.responses.tool_choice_function import ToolChoiceFunction
 from xgrammar import StructuralTag, normalize_tool_choice
 from xgrammar import get_model_structural_tag as get_xgrammar_model_structural_tag
 from xgrammar.openai_tool_call_schema import (
@@ -30,15 +25,11 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionToolsParam,
 )
 
-ToolChoice: TypeAlias = (
-    Literal["none", "auto", "required"]
-    | ChatCompletionNamedToolChoiceParam
-    | ResponsesToolChoice
-    | None
+ToolChoice = (
+    Literal["none", "auto", "required"] | ChatCompletionNamedToolChoiceParam | None
 )
-AllowedToolRef: TypeAlias = dict[str, object]
-SimplifiedToolChoice: TypeAlias = Literal["auto", "required", "forced"]
-StructuralTagBuilder: TypeAlias = Callable[
+SimplifiedToolChoice = Literal["auto", "required", "forced"]
+StructuralTagBuilder = Callable[
     [
         list[FunctionToolParam],
         list[BuiltinToolParam],
@@ -84,20 +75,9 @@ def register_vllm_structural_tag(model: str):
     return decorator
 
 
-def _any_tool_strict(
-    tools: Sequence[ChatCompletionToolsParam | ResponsesTool],
-) -> bool:
-    for tool in tools:
-        if isinstance(tool, FunctionTool) and tool.strict is True:
-            return True
-        if isinstance(tool, ChatCompletionToolsParam) and tool.function.strict is True:
-            return True
-    return False
-
-
 def get_model_structural_tag(
     model: str,
-    tools: Sequence[ChatCompletionToolsParam | ResponsesTool] | None,
+    tools: list[ChatCompletionToolsParam] | None,
     tool_choice: ToolChoice,
     reasoning: bool,
 ) -> StructuralTag | None:
@@ -106,11 +86,8 @@ def get_model_structural_tag(
     if not tools or tool_choice == "none":
         return None
 
-    if tool_choice == "auto" and not _any_tool_strict(tools):
-        return None
-
-    dumped_tools = [_dump_tool_for_xgrammar(tool) for tool in tools]
-    dumped_tool_choice = _dump_tool_choice_for_xgrammar(tool_choice)
+    dumped_tools = [_model_dump(tool) for tool in tools]
+    dumped_tool_choice = _model_dump(tool_choice)
 
     if model in _VLLM_STRUCTURAL_TAG_REGISTRY:
         function_tools, builtin_tools, simplified_tool_choice = normalize_tool_choice(
@@ -136,72 +113,12 @@ def get_model_structural_tag(
     )
 
 
-def _dump_tool_for_xgrammar(
-    tool: ChatCompletionToolsParam | ResponsesTool,
-) -> dict[str, Any]:
-    """Convert tool objects to xgrammar's Chat Completions tool protocol."""
+def _model_dump(value: Any) -> Any:
+    """Convert vLLM/Pydantic request objects to xgrammar's dict protocol."""
 
-    if isinstance(tool, FunctionTool):
-        function: dict[str, Any] = {"name": tool.name}
-        if tool.description is not None:
-            function["description"] = tool.description
-        if tool.parameters is not None:
-            function["parameters"] = tool.parameters
-        if tool.strict is not None:
-            function["strict"] = tool.strict
-        return {"type": "function", "function": function}
-    dumped_tool = tool.model_dump(mode="json", exclude_none=True)
-    if isinstance(tool, ChatCompletionToolsParam):
-        return dumped_tool
-    return dict(dumped_tool)
-
-
-def _dump_tool_choice_for_xgrammar(
-    tool_choice: ToolChoice,
-) -> dict[str, Any] | str | None:
-    """Convert tool_choice objects to xgrammar's expected protocol."""
-
-    if tool_choice is None:
-        return None
-
-    if isinstance(tool_choice, str):
-        return tool_choice
-
-    if isinstance(tool_choice, ChatCompletionNamedToolChoiceParam):
-        return tool_choice.model_dump(mode="json", exclude_none=True)
-
-    if isinstance(tool_choice, ToolChoiceFunction):
-        return {
-            "type": "function",
-            "function": {"name": tool_choice.name},
-        }
-
-    if isinstance(tool_choice, ToolChoiceAllowed):
-        return {
-            "type": "allowed_tools",
-            "allowed_tools": {
-                "mode": tool_choice.mode,
-                "tools": [
-                    _dump_allowed_tool_ref_for_xgrammar(tool)
-                    for tool in tool_choice.tools
-                ],
-            },
-        }
-
-    return tool_choice.model_dump(mode="json", exclude_none=True)
-
-
-def _dump_allowed_tool_ref_for_xgrammar(tool_ref: AllowedToolRef) -> AllowedToolRef:
-    if (
-        tool_ref.get("type") == "function"
-        and "function" not in tool_ref
-        and "name" in tool_ref
-    ):
-        return {
-            "type": "function",
-            "function": {"name": tool_ref["name"]},
-        }
-    return tool_ref
+    if hasattr(value, "model_dump"):
+        return value.model_dump(exclude_none=True)
+    return value
 
 
 def _get_function_parameters(function) -> dict[str, Any] | bool:

@@ -59,8 +59,9 @@ def _run_gsm8k_eval(server: RemoteOpenAIServer, stage: str) -> float:
     return accuracy
 
 
-def _base_serve_args(use_async_eplb: bool = False) -> list[str]:
-    args = [
+@multi_gpu_test(num_gpus=4)
+def test_elastic_ep_scaling():
+    vllm_serve_args = [
         "--trust-remote-code",
         "--tensor-parallel-size",
         "1",
@@ -78,11 +79,7 @@ def _base_serve_args(use_async_eplb: bool = False) -> list[str]:
         "--eplb-config.num_redundant_experts",
         "0",
         "--eplb-config.use_async",
-        "true" if use_async_eplb else "false",
-        "--eplb-config.step_interval",
-        "10",
-        "--eplb-config.window_size",
-        "5",
+        "false",
         "--data-parallel-backend",
         "ray",
         "--data-parallel-size",
@@ -93,23 +90,7 @@ def _base_serve_args(use_async_eplb: bool = False) -> list[str]:
 
     leader_address = os.environ.get("LEADER_ADDRESS")
     if leader_address:
-        args.extend(["--data-parallel-address", leader_address])
-
-    return args
-
-
-@pytest.mark.parametrize(
-    "use_async_eplb", [False, True], ids=["sync_eplb", "async_eplb"]
-)
-@multi_gpu_test(num_gpus=4)
-def test_elastic_ep_scaling(use_async_eplb: bool):
-    if use_async_eplb:
-        from vllm.distributed.eplb.eplb_communicator import has_nixl
-
-        if not has_nixl():
-            pytest.skip("Async EPLB with elastic EP requires NIXL (not installed)")
-
-    vllm_serve_args = _base_serve_args(use_async_eplb)
+        vllm_serve_args.extend(["--data-parallel-address", leader_address])
 
     with RemoteOpenAIServer(
         MODEL_NAME, vllm_serve_args, env_dict={}, max_wait_seconds=1200
@@ -147,24 +128,44 @@ def test_elastic_ep_scaling(use_async_eplb: bool):
         print(f"  Tolerance:  {ACCURACY_TOL:.3f}")
 
 
-@pytest.mark.parametrize(
-    "use_async_eplb", [False, True], ids=["sync_eplb", "async_eplb"]
-)
 @multi_gpu_test(num_gpus=4)
-def test_elastic_ep_scaling_uneven(use_async_eplb: bool):
+def test_elastic_ep_scaling_uneven():
     """Test scale up with uneven worker distribution.
 
     This tests the case where num_new_workers % old_dp_size != 0,
     specifically 2 -> 3 where remainder = 1 % 2 = 1.
     This exercises the remainder handling in sender-receiver pairing.
     """
-    if use_async_eplb:
-        from vllm.distributed.eplb.eplb_communicator import has_nixl
+    vllm_serve_args = [
+        "--trust-remote-code",
+        "--tensor-parallel-size",
+        "1",
+        "--gpu-memory-utilization",
+        "0.8",
+        "--max-model-len",
+        "4096",
+        "--max-num-seqs",
+        str(MAX_NUM_SEQS),
+        "--enable-expert-parallel",
+        "--all2all-backend",
+        "allgather_reducescatter",
+        "--enable-elastic-ep",
+        "--enable-eplb",
+        "--eplb-config.num_redundant_experts",
+        "0",
+        "--eplb-config.use_async",
+        "false",
+        "--data-parallel-backend",
+        "ray",
+        "--data-parallel-size",
+        "2",
+        "--api-server-count",
+        "1",
+    ]
 
-        if not has_nixl():
-            pytest.skip("Async EPLB with elastic EP requires NIXL (not installed)")
-
-    vllm_serve_args = _base_serve_args(use_async_eplb)
+    leader_address = os.environ.get("LEADER_ADDRESS")
+    if leader_address:
+        vllm_serve_args.extend(["--data-parallel-address", leader_address])
 
     with RemoteOpenAIServer(
         MODEL_NAME, vllm_serve_args, env_dict={}, max_wait_seconds=1200

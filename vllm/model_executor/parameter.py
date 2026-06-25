@@ -39,7 +39,11 @@ class BasevLLMParameter(Parameter):
     def __new__(cls, data: torch.Tensor | None, **kwargs):
         return super().__new__(cls, data=data, requires_grad=False)
 
-    def __init__(self, data: torch.Tensor, weight_loader: Callable):
+    def __init__(
+        self,
+        data: torch.Tensor,
+        weight_loader: Callable,
+    ):
         """
         Initialize the BasevLLMParameter
 
@@ -64,6 +68,25 @@ class BasevLLMParameter(Parameter):
         self._weight_loader = weight_loader
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
+        # Heterogeneous TP: ``tp_partition_sizes_output`` /
+        # ``tp_partition_sizes_input`` carry the full per-rank partition lists
+        # for the parameter's output/input dim respectively. When unset (None),
+        # the legacy ``tp_rank * shard_size`` formula is used for that dim.
+        self.tp_partition_sizes_output: list[int] | None = None
+        self.tp_partition_sizes_input: list[int] | None = None
+
+    def _tp_partition_offset(
+        self, partition_sizes: list[int] | None
+    ) -> int:
+        """Cumulative offset across previous ranks for the relevant dim.
+
+        When ``partition_sizes`` is ``None`` the legacy ``tp_rank`` value is
+        used directly (every rank's shard has the same size); otherwise the
+        offset is ``sum(partition_sizes[:rank])``.
+        """
+        if partition_sizes is None:
+            return self.tp_rank
+        return sum(partition_sizes[: self.tp_rank])
 
     @property
     def weight_loader(self) -> Callable:
@@ -147,8 +170,12 @@ class _ColumnvLLMParameter(BasevLLMParameter):
 
     def load_column_parallel_weight(self, loaded_weight: torch.Tensor):
         shard_size = self.data.shape[self.output_dim]
+        # Heterogeneous TP: cumulative offset across previous ranks (uses the
+        # output-dim partition list when set; collapses to ``tp_rank`` under
+        # the legacy uniform-TP path).
+        start_idx = self._tp_partition_offset(self.tp_partition_sizes_output)
         loaded_weight = loaded_weight.narrow(
-            self.output_dim, self.tp_rank * shard_size, shard_size
+            self.output_dim, start_idx, shard_size
         )
         assert self.data.shape == loaded_weight.shape
         self.data.copy_(loaded_weight)
@@ -156,6 +183,16 @@ class _ColumnvLLMParameter(BasevLLMParameter):
     def load_merged_column_weight(self, loaded_weight: torch.Tensor, **kwargs):
         shard_offset: int = kwargs["shard_offset"]
         shard_size: int = kwargs["shard_size"]
+        # Heterogeneous TP: the loaded_weight (full QKV/MLP matrix on disk)
+        # offset for this rank's segment slice is ``sum(seg_part_sizes[:rank])``,
+        # which is generally *not* equal to ``tp_rank * shard_size`` when the
+        # partition sizes are non-uniform. The linear layer passes the correct
+        # offset in ``loaded_weight_offset``; we fall back to the legacy
+        # uniform-TP formula when it isn't supplied.
+        loaded_weight_offset: int = kwargs.get(
+            "loaded_weight_offset",
+            self.tp_rank * shard_size,
+        )
 
         # TODO: move these to PackedColumnParameter and PackedvLLMParameter
         if (
@@ -170,16 +207,24 @@ class _ColumnvLLMParameter(BasevLLMParameter):
 
         param_data = param_data.narrow(self.output_dim, shard_offset, shard_size)
         loaded_weight = loaded_weight.narrow(
-            self.output_dim, self.tp_rank * shard_size, shard_size
+            self.output_dim, loaded_weight_offset, shard_size
         )
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
-
     def load_qkv_weight(self, loaded_weight: torch.Tensor, **kwargs):
         shard_offset: int = kwargs["shard_offset"]
         shard_size: int = kwargs["shard_size"]
         shard_id: str = kwargs["shard_id"]
         num_heads: int = kwargs["num_heads"]
+        # Heterogeneous TP: the offset within the *full* loaded_weight for
+        # this rank's chunk is computed by the linear layer and passed in;
+        # the legacy ``shard_id_int * shard_size`` formula only matches when
+        # the partition sizes are uniform.
+        loaded_weight_offset: int = kwargs.get(
+            "loaded_weight_offset",
+            (self.tp_rank if shard_id == "q" else self.tp_rank // num_heads)
+            * shard_size,
+        )
 
         # TODO: move these to PackedColumnParameter and PackedvLLMParameter
         if (
@@ -191,10 +236,9 @@ class _ColumnvLLMParameter(BasevLLMParameter):
             )
 
         param_data = self.data
-        shard_id_int = self.tp_rank if shard_id == "q" else self.tp_rank // num_heads
         param_data = param_data.narrow(self.output_dim, shard_offset, shard_size)
         loaded_weight = loaded_weight.narrow(
-            self.output_dim, shard_id_int * shard_size, shard_size
+            self.output_dim, loaded_weight_offset, shard_size
         )
 
         assert param_data.shape == loaded_weight.shape
@@ -219,8 +263,11 @@ class RowvLLMParameter(BasevLLMParameter):
 
     def load_row_parallel_weight(self, loaded_weight: torch.Tensor):
         shard_size = self.data.shape[self.input_dim]
+        # Heterogeneous TP: cumulative offset across previous ranks for the
+        # input dim (see ``load_column_parallel_weight``).
+        start_idx = self._tp_partition_offset(self.tp_partition_sizes_input)
         loaded_weight = loaded_weight.narrow(
-            self.input_dim, self.tp_rank * shard_size, shard_size
+            self.input_dim, start_idx, shard_size
         )
 
         if len(loaded_weight.shape) == 0:

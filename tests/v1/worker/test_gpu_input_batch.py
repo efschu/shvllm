@@ -10,6 +10,7 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
+from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.utils.torch_utils import make_tensor_with_pad
 from vllm.v1.pool.metadata import PoolingMetadata
 from vllm.v1.sample.logits_processor import LogitsProcessors
@@ -235,6 +236,7 @@ def test_sampling_metadata_in_input_batch(device: str, batch_size: int):
         max_model_len=1024,
         max_num_batched_tokens=1024,
         device=torch.device(device),
+        pin_memory=is_pin_memory_available(),
         vocab_size=1024,
         block_sizes=[1],
         kernel_block_sizes=[1],
@@ -329,6 +331,7 @@ def test_swap_states_in_input_batch(device: str, batch_size: int, swap_list: lis
         max_model_len=1024,
         max_num_batched_tokens=1024,
         device=torch.device(device),
+        pin_memory=is_pin_memory_available(),
         vocab_size=1024,
         block_sizes=[1],
         kernel_block_sizes=[1],
@@ -338,6 +341,7 @@ def test_swap_states_in_input_batch(device: str, batch_size: int, swap_list: lis
         max_model_len=1024,
         max_num_batched_tokens=1024,
         device=torch.device(device),
+        pin_memory=is_pin_memory_available(),
         vocab_size=1024,
         block_sizes=[1],
         kernel_block_sizes=[1],
@@ -406,6 +410,7 @@ def test_pooling_prompt_lens_not_aliased(device: str):
         max_model_len=MAX_PROMPT_SIZE + NUM_OUTPUT_TOKENS,
         max_num_batched_tokens=batch_size * (MAX_PROMPT_SIZE + NUM_OUTPUT_TOKENS),
         device=torch.device(device),
+        pin_memory=is_pin_memory_available(),
         vocab_size=VOCAB_SIZE,
         block_sizes=[16],
         kernel_block_sizes=[16],
@@ -454,6 +459,7 @@ def test_pooling_metadata_token_id_buffers(
         max_model_len=MAX_PROMPT_SIZE + NUM_OUTPUT_TOKENS,
         max_num_batched_tokens=MAX_PROMPT_SIZE + NUM_OUTPUT_TOKENS,
         device=torch.device("cpu"),
+        pin_memory=False,
         vocab_size=VOCAB_SIZE,
         block_sizes=[16],
         kernel_block_sizes=[16],

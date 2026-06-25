@@ -10,7 +10,6 @@ import numpy as np
 from typing_extensions import assert_never
 
 from vllm.benchmarks.datasets import DEFAULT_NUM_PROMPTS
-from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.import_utils import PlaceholderModule
 
 from .param_sweep import ParameterSweep, ParameterSweepItem
@@ -274,7 +273,7 @@ class SweepServeWorkloadArgs(SweepServeArgs):
         )
 
     @classmethod
-    def add_cli_args(cls, parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
+    def add_cli_args(cls, parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         parser = super().add_cli_args(parser)
 
         workload_group = parser.add_argument_group("workload options")
@@ -323,7 +322,7 @@ def main(args: argparse.Namespace):
 
 
 if __name__ == "__main__":
-    parser = FlexibleArgumentParser(description=SweepServeWorkloadArgs.parser_help)
+    parser = argparse.ArgumentParser(description=SweepServeWorkloadArgs.parser_help)
     SweepServeWorkloadArgs.add_cli_args(parser)
 
     main(parser.parse_args())

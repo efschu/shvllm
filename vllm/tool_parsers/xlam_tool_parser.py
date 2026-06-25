@@ -165,7 +165,7 @@ class xLAMToolParser(ToolParser):
                     function=FunctionCall(
                         name=call["name"],
                         arguments=(
-                            json.dumps(call["arguments"], ensure_ascii=False)
+                            json.dumps(call["arguments"])
                             if isinstance(call["arguments"], dict)
                             else call["arguments"]
                         ),
@@ -473,9 +473,7 @@ class xLAMToolParser(ToolParser):
                             ):
                                 current_tool = parsed_tools[current_idx]
                                 if isinstance(current_tool.get("arguments"), dict):
-                                    args_text = json.dumps(
-                                        current_tool["arguments"], ensure_ascii=False
-                                    )
+                                    args_text = json.dumps(current_tool["arguments"])
                                 else:
                                     args_text = str(current_tool.get("arguments", "{}"))
                         except (json.JSONDecodeError, KeyError, IndexError):

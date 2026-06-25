@@ -704,14 +704,7 @@ class FlashInferNVLinkOneSidedManager(All2AllManagerBase):
         self.num_experts = num_experts
 
         self.cleanup()
-        from vllm.platforms.interface import get_assigned_physical_gpu_ids
-
-        assigned_physical_gpu_ids = get_assigned_physical_gpu_ids()
-        gpus_per_node = (
-            len(assigned_physical_gpu_ids)
-            if assigned_physical_gpu_ids is not None
-            else torch.accelerator.device_count()
-        )
+        gpus_per_node = torch.accelerator.device_count()
         logger.debug(
             "Making One-sided NVLink mapping: rank=%d, world size=%d",
             self.rank,

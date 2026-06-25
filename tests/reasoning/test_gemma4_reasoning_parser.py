@@ -54,7 +54,7 @@ NO_REASONING = {
     "output": "This is content",
     "reasoning": None,
     "content": "This is content",
-    "is_reasoning_end": True,
+    "is_reasoning_end": False,
 }
 REASONING_WITH_CHANNEL = {
     "output": "<|channel>This is a reasoning section<channel|>This is the rest",
@@ -83,15 +83,15 @@ CHANNEL_NO_END = {
 EMPTY = {
     "output": "",
     "reasoning": None,
-    "content": None,
-    "is_reasoning_end": True,
+    "content": "",
+    "is_reasoning_end": False,
 }
 NEW_LINE_NONSTREAMING = {
     "output": (
         "Before\n<|channel>This is a reasoning section<channel|>\nThis is the rest"
     ),
     "reasoning": "This is a reasoning section",
-    "content": "Before\n\nThis is the rest",
+    "content": "\nThis is the rest",
     "is_reasoning_end": True,
 }
 NEW_LINE_STREAMING = {
@@ -111,7 +111,7 @@ THOUGHT_PREFIX = {
 }
 THOUGHT_PREFIX_ONLY = {
     "output": "<|channel>thought\n<channel|>",
-    "reasoning": None,
+    "reasoning": "",
     "content": None,
     "is_reasoning_end": True,
 }

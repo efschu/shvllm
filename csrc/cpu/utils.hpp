@@ -8,15 +8,13 @@
 #include "cpu/cpu_types.hpp"
 
 namespace cpu_utils {
-enum class ISA { AMX, VEC, RVV };
+enum class ISA { AMX, VEC };
 
 inline ISA get_isa(const std::string& isa) {
   if (isa == "amx") {
     return ISA::AMX;
   } else if (isa == "vec") {
     return ISA::VEC;
-  } else if (isa == "rvv") {
-    return ISA::RVV;
   } else {
     TORCH_CHECK(false, "Invalid isa type: " + isa);
   }

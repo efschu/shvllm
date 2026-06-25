@@ -29,8 +29,6 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("transport error")]
     Transport(#[from] zeromq::ZmqError),
-    #[error("ZMQ runtime task failed")]
-    ZmqRuntimeTask(#[from] tokio::task::JoinError),
     #[error("engine core reported fatal failure")]
     EngineCoreDead,
     #[error("startup handshake timed out while waiting for {stage} after {timeout:?}")]

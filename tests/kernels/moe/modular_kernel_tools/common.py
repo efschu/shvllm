@@ -328,10 +328,7 @@ class Config:
         if self.needs_deep_ep_v2() and not has_deep_ep_v2():
             return False, "Needs DeepEP v2, but DeepEP v2 not available."
         if self.needs_deep_gemm() and not has_deep_gemm():
-            return (
-                False,
-                "Needs DeepGEMM, but the current vLLM environment does not provide it.",
-            )
+            return False, "Needs DeepGEMM, but DeepGEMM not available."
         if self.needs_aiter() and not has_aiter():  # noqa: SIM103
             return False, "Needs Aiter, but Aiter not available."
         if self.needs_mori() and not has_mori():  # noqa: SIM103

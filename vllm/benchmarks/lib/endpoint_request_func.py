@@ -75,7 +75,7 @@ class RequestFuncInput:
     logprobs: int | None = None
     extra_headers: dict | None = None
     extra_body: dict | None = None
-    multi_modal_content: dict[str, Any] | list[dict[str, Any]] | None = None
+    multi_modal_content: dict | list[dict] | None = None
     ignore_eos: bool = False
     language: str | None = None
     request_id: str | None = None
@@ -272,13 +272,13 @@ def _get_chat_content(
     request_func_input: RequestFuncInput,
     mm_position: Literal["first", "last"] = "last",
 ) -> list[dict[str, Any]]:
-    mm_contents: list[dict[str, Any]] = []
+    mm_contents = []
     if request_func_input.multi_modal_content:
         mm_content = request_func_input.multi_modal_content
         if isinstance(mm_content, list):
-            mm_contents.extend(mm_content)
+            mm_contents.extend(request_func_input.multi_modal_content)
         elif isinstance(mm_content, dict):
-            mm_contents.append(mm_content)
+            mm_contents.append(request_func_input.multi_modal_content)
         else:
             raise TypeError(
                 "multi_modal_content must be a dict or list[dict] for openai-chat"
@@ -293,11 +293,10 @@ def _get_chat_content(
             for item in prompt
         )
     ):
-        prompt_dicts: list[dict[str, Any]] = prompt  # type: ignore[assignment]
         if mm_position == "first":
-            return mm_contents + prompt_dicts
+            return mm_contents + prompt
 
-        return prompt_dicts + mm_contents
+        return prompt + mm_contents
 
     text_contents = [{"type": "text", "text": prompt}]
 
@@ -308,15 +307,15 @@ def _get_chat_content(
 
 
 def _is_chat_messages(prompt: Any) -> bool:
-    if not isinstance(prompt, list):
-        return False
-    if not prompt:
-        return False
-    return all(
-        isinstance(item, dict)
-        and isinstance(item.get("role"), str)
-        and isinstance(item.get("content"), (str, list))
-        for item in prompt
+    return (
+        isinstance(prompt, list)
+        and prompt
+        and all(
+            isinstance(item, dict)
+            and isinstance(item.get("role"), str)
+            and isinstance(item.get("content"), (str, list))
+            for item in prompt
+        )
     )
 
 
@@ -326,7 +325,7 @@ def _get_chat_messages(
 ) -> list[dict[str, Any]]:
     prompt = request_func_input.prompt
     if _is_chat_messages(prompt):
-        return prompt  # type: ignore[return-value]
+        return prompt
 
     return [
         {
@@ -386,8 +385,8 @@ async def async_request_openai_chat_completions(
                     if not chunk_bytes:
                         continue
 
-                    message_strings = handler.add_chunk(chunk_bytes)
-                    for message in message_strings:
+                    messages = handler.add_chunk(chunk_bytes)
+                    for message in messages:
                         # NOTE: SSE comments (often used as pings) start with
                         # a colon. These are not JSON data payload and should
                         # be skipped.
@@ -791,7 +790,7 @@ async def async_request_infinity_embeddings(
     api_url = request_func_input.api_url
     _validate_api_url(api_url, "Infinity Embeddings API", "embeddings")
 
-    payload: dict[str, Any] = {
+    payload = {
         "model": request_func_input.model_name
         if request_func_input.model_name
         else request_func_input.model,
@@ -850,10 +849,7 @@ async def async_request_vllm_pooling(
         "truncate_prompt_tokens": -1,
     }
 
-    if isinstance(request_func_input.prompt, dict):
-        payload = payload | request_func_input.prompt
-    else:
-        payload["input"] = request_func_input.prompt
+    payload = payload | request_func_input.prompt
 
     _update_payload_common(payload, request_func_input)
 

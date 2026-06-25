@@ -5,10 +5,6 @@ steps:
 - label: LoRA Runtime + Utils
   timeout_in_minutes: 45
   device: intel_gpu
-  agent_tags:
-    label: production
-    gpu: 1+
-    mem: 24+
   no_plugin: true
   working_dir: "."
   env:
@@ -38,10 +34,6 @@ steps:
 - label: LoRA Fused/MoE Kernels
   timeout_in_minutes: 45
   device: intel_gpu
-  agent_tags:
-    label: production
-    gpu: 1+
-    mem: 16+
   no_plugin: true
   working_dir: "."
   env:
@@ -62,10 +54,6 @@ steps:
 - label: LoRA Punica Kernels
   timeout_in_minutes: 45
   device: intel_gpu
-  agent_tags:
-    label: production
-    gpu: 1+
-    mem: 16+
   no_plugin: true
   working_dir: "."
   env:
@@ -86,10 +74,6 @@ steps:
 - label: LoRA Punica FP8/XPU Ops
   timeout_in_minutes: 45
   device: intel_gpu
-  agent_tags:
-    label: production
-    gpu: 1+
-    mem: 16+
   no_plugin: true
   working_dir: "."
   env:
@@ -110,10 +94,6 @@ steps:
 - label: LoRA Models
   timeout_in_minutes: 45
   device: intel_gpu
-  agent_tags:
-    label: production
-    gpu: 2+
-    mem: 24+
   no_plugin: true
   working_dir: "."
   env:
@@ -137,10 +117,6 @@ steps:
 - label: LoRA Multimodal
   timeout_in_minutes: 45
   device: intel_gpu
-  agent_tags:
-    label: production
-    gpu: 1+
-    mem: 16+
   no_plugin: true
   working_dir: "."
   env:

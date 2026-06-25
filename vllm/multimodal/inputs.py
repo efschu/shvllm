@@ -488,13 +488,7 @@ class MultiModalBatchedField(BaseMultiModalField):
                 # An optimization when `batch` contains only one tensor:
                 # - produce exactly same result as `torch.stack(batch)`
                 # - will achieve zero-copy if the tensor is contiguous
-                out = batch[0].unsqueeze(0)
-                if not pin_memory:
-                    return out.contiguous()
-                # Avoid extra copy - pinning unpinned memory will make it contiguous
-                if not out.is_contiguous() and out.is_pinned():
-                    out = out.contiguous()
-                return out.pin_memory()
+                return batch[0].unsqueeze(0).contiguous()
             first_shape = batch[0].shape
             if all(elem.shape == first_shape for elem in batch):
                 out = torch.empty(
@@ -544,13 +538,7 @@ class MultiModalFlatField(BaseMultiModalField):
                 # An optimization when `batch` contains only one tensor:
                 # - produce exactly same result as `torch.concat(batch)`
                 # - will achieve zero-copy if the tensor is contiguous
-                out = batch[0]
-                if not pin_memory:
-                    return out.contiguous()
-                # Avoid extra copy - pinning unpinned memory will make it contiguous
-                if not out.is_contiguous() and out.is_pinned():
-                    out = out.contiguous()
-                return out.pin_memory()
+                return batch[0].contiguous()
 
             dim = self.dim + (self.dim < 0) * len(batch[0].shape)
 

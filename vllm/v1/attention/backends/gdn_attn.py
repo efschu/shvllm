@@ -8,7 +8,6 @@ from typing import Literal
 import torch
 
 from vllm.config import VllmConfig
-from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -204,8 +203,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 spec_sequence_masks = None
                 spec_sequence_masks_cpu = None
             else:
-                spec_sequence_masks = async_tensor_h2d(
-                    spec_sequence_masks_cpu, device=query_start_loc.device
+                spec_sequence_masks = spec_sequence_masks_cpu.to(
+                    query_start_loc.device, non_blocking=True
                 )
 
         if spec_sequence_masks is None:
@@ -377,14 +376,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 )
 
                 assert prefill_query_start_loc_cpu is not None
-                chunk_indices = async_tensor_h2d(
-                    prepare_chunk_indices(prefill_query_start_loc_cpu, FLA_CHUNK_SIZE),
-                    device=gpu_device,
-                )
-                chunk_offsets = async_tensor_h2d(
-                    prepare_chunk_offsets(prefill_query_start_loc_cpu, FLA_CHUNK_SIZE),
-                    device=gpu_device,
-                )
+                chunk_indices = prepare_chunk_indices(
+                    prefill_query_start_loc_cpu, FLA_CHUNK_SIZE
+                ).to(device=gpu_device, non_blocking=True)
+                chunk_offsets = prepare_chunk_offsets(
+                    prefill_query_start_loc_cpu, FLA_CHUNK_SIZE
+                ).to(device=gpu_device, non_blocking=True)
 
         if num_prefills > 0:
             has_initial_state = context_lens_tensor > 0
@@ -410,10 +407,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             f"num_decodes: {num_decodes}, num_spec_decodes: {num_spec_decodes}"
         )
 
-        # Prepare per-request tensors for cudagraph. m.num_actual_tokens is
-        # token-padded for FULL graph replay, but the GDN state/query/accepted
-        # metadata below is indexed by request.
-        batch_size = m.num_reqs
+        # Prepare tensors for cudagraph
+        # Note: m.num_actual_tokens is already padded by the model runner for CUDAGraph
+        batch_size = m.num_actual_tokens
 
         if (
             self.use_full_cuda_graph

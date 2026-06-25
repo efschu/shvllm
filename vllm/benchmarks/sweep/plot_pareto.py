@@ -8,7 +8,6 @@ from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
-from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.collection_utils import full_groupby
 from vllm.utils.import_utils import PlaceholderModule
 
@@ -343,7 +342,7 @@ class SweepPlotParetoArgs:
         )
 
     @classmethod
-    def add_cli_args(cls, parser: FlexibleArgumentParser):
+    def add_cli_args(cls, parser: argparse.ArgumentParser):
         parser.add_argument(
             "EXPERIMENT_DIR",
             type=str,
@@ -395,7 +394,7 @@ def main(args: argparse.Namespace):
 
 
 if __name__ == "__main__":
-    parser = FlexibleArgumentParser(description=SweepPlotParetoArgs.parser_help)
+    parser = argparse.ArgumentParser(description=SweepPlotParetoArgs.parser_help)
     SweepPlotParetoArgs.add_cli_args(parser)
 
     main(parser.parse_args())

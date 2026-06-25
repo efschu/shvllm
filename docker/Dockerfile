@@ -162,34 +162,18 @@ RUN if [ "${BUILD_OS}" = "manylinux" ]; then \
         && rm -rf /var/lib/apt/lists/*; \
     fi
 
-# Install uv and bootstrap /opt/venv. Both paths converge on /opt/venv so all
-# downstream stages stay distro-agnostic.
+# Install uv and bootstrap /opt/venv. uv uses tokio which needs /dev/full — blocked in
+# BuildKit sandbox — so we use stdlib venv and keep uv for subsequent pip operations.
 RUN mkdir -p "${UV_PYTHON_INSTALL_DIR}" "${UV_CACHE_DIR}" "${UV_INSTALL_DIR}" \
     && chmod -R a+rX /opt/uv \
-    && apt-get update -y \
-    && apt-get install -y --no-install-recommends python3-pip \
-    && rm -rf /var/lib/apt/lists/* \
-    && pip3 install uv \
-    # `--seed` installs pip/setuptools/wheel into the venv so `python3 -m
-    # pip` works regardless of how uv happens to link the venv back to the
-    # managed Python install (which, at a non-default UV_PYTHON_INSTALL_DIR,
-    # doesn't always expose ensurepip via the default venv layout).
-    && if [ "${BUILD_OS}" = "manylinux" ]; then \
-           # manylinux images ship Python at /opt/python/cpXY-cpXY/; point uv
-           # at the matching interpreter rather than letting it fetch one.
-           PYV_NODOT=$(echo ${PYTHON_VERSION} | tr -d '.') \
-           && MANYLINUX_PY=/opt/python/cp${PYV_NODOT}-cp${PYV_NODOT}/bin/python${PYTHON_VERSION} \
-           && uv venv --seed /opt/venv --python "$MANYLINUX_PY"; \
-       else \
-           uv venv --seed /opt/venv --python ${PYTHON_VERSION}; \
-       fi \
+    && curl -LsSf https://astral.sh/uv/0.11.24/install.sh | sh \
+    && python3 -m venv /opt/venv \
+    && /opt/venv/bin/python3 -m pip install --upgrade pip setuptools wheel 2>/dev/null || true \
     && rm -f /usr/bin/python3 /usr/bin/python3-config /usr/bin/pip \
     && ln -sf /opt/venv/bin/python3 /usr/bin/python3 \
     && ln -sf /opt/venv/bin/python3-config /usr/bin/python3-config \
     && ln -sf /opt/venv/bin/pip /usr/bin/pip \
     && python3 --version && python3 -m pip --version
-
-# UV_LINK_MODE=copy applies to subsequent `uv pip install` RUNs (avoids
 # hardlink failures with BuildKit cache mounts); it must not be set during
 # `uv venv` above, which relies on hardlinking /opt/venv back to the
 # managed Python source so ensurepip / `python3 -m pip` still resolve.

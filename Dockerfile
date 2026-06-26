@@ -41,7 +41,8 @@ COPY setup.py setup.py
 COPY rust-toolchain.toml rust-toolchain.toml
 
 # torch nightly mit CUDA 12.8 - unterstützt SM120 (RTX 5090)
-RUN pip install --no-cache-dir --pre torch==2.12.0.dev20260408+cu128 torchvision==0.27.0.dev20260408+cu128 \
+# torchvision ist nicht verfügbar für cu128 nightly, nur torch installieren
+RUN pip install --no-cache-dir --pre torch==2.12.0.dev20260408+cu128 \
     --index-url https://download.pytorch.org/whl/nightly/cu128 \
     --break-system-packages
 

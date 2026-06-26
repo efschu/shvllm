@@ -38,6 +38,7 @@ from vllm.model_executor.parameter import (
     PerTensorScaleParameter,
     RowvLLMParameter,
 )
+from vllm.logger import init_logger
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 

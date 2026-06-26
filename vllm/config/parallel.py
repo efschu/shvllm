@@ -970,14 +970,17 @@ class ParallelConfig:
                 current_platform.is_cuda()
                 and current_platform.device_count() < self.world_size
             ):
-                gpu_count = current_platform.device_count()
-                raise ValueError(
-                    f"World size ({self.world_size}) is larger than the number of "
-                    f"available GPUs ({gpu_count}) in this node. If this is "
-                    "intentional and you are using:\n"
-                    "- ray, set '--distributed-executor-backend ray'.\n"
-                    "- multiprocessing, set '--nnodes' appropriately."
-                )
+                # When tensor_parallel_rank_gpus is specified, multiple ranks
+                # can share the same GPU, so world_size > device_count is valid
+                if self.tensor_parallel_rank_gpus is None:
+                    gpu_count = current_platform.device_count()
+                    raise ValueError(
+                        f"World size ({self.world_size}) is larger than the number of "
+                        f"available GPUs ({gpu_count}) in this node. If this is "
+                        "intentional and you are using:\n"
+                        "- ray, set '--distributed-executor-backend ray'.\n"
+                        "- multiprocessing, set '--nnodes' appropriately."
+                    )
             elif self.data_parallel_backend == "ray":
                 logger.info(
                     "Using ray distributed inference because "

@@ -311,6 +311,33 @@ def _parse_tp_weights(value: str | None) -> list[float] | None:
     return weights
 
 
+def _parse_tp_rank_gpus(value: str | None) -> list[int] | None:
+    """Parse the ``--tensor-parallel-rank-gpus`` CLI string.
+
+    Accepts a comma-separated list of integers (e.g. ``"0,0,1,2"``) and returns
+    the corresponding ``list[int]``. Whitespace around entries is stripped,
+    empty values are rejected. Returns ``None`` for ``None``/empty input so
+    the resulting ``ParallelConfig.tensor_parallel_rank_gpus`` is ``None`` and
+    ranks are assigned round-robin across available GPUs.
+    """
+    if value is None:
+        return None
+    stripped = value.strip()
+    if not stripped:
+        return None
+    try:
+        gpus = [int(part.strip()) for part in stripped.split(",")]
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(
+            f"--tensor-parallel-rank-gpus expects comma-separated integers, "
+            f"got {value!r}"
+        ) from e
+    if len(gpus) < 1:
+        raise argparse.ArgumentTypeError(
+            "--tensor-parallel-rank-gpus requires at least one entry"
+        )
+    return gpus
+
 
 @functools.lru_cache(maxsize=30)
 def _compute_kwargs(cls: ConfigType) -> dict[str, dict[str, Any]]:
@@ -497,6 +524,11 @@ class EngineArgs:
     """Comma-separated relative weights per TP rank, e.g. ``"2,1,1"``. Must
     have exactly ``tensor_parallel_size`` entries. When unset or empty, each
     rank receives an equal share."""
+    tensor_parallel_rank_gpus: str | None = None
+    """Comma-separated GPU indices per TP rank, e.g. ``"0,0,1,2"`` to assign
+    ranks 0 and 1 to GPU 0, rank 2 to GPU 1, rank 3 to GPU 2. Must have
+    exactly ``tensor_parallel_size`` entries, all >= 0 and < num_gpus.
+    When unset, ranks are assigned round-robin across available GPUs."""
     prefill_context_parallel_size: int = ParallelConfig.prefill_context_parallel_size
     decode_context_parallel_size: int = ParallelConfig.decode_context_parallel_size
     dcp_comm_backend: DCPCommBackend = ParallelConfig.dcp_comm_backend
@@ -1019,6 +1051,17 @@ class EngineArgs:
                 "Comma-separated relative weights per TP rank, e.g. '2,1,1'. "
                 "Must have exactly --tensor-parallel-size entries, all > 0. "
                 "When unset, each TP rank receives an equal share."
+            ),
+        )
+        parallel_group.add_argument(
+            "--tensor-parallel-rank-gpus",
+            type=str,
+            default=None,
+            help=(
+                "Comma-separated GPU indices per TP rank, e.g. '0,0,1,2' to assign "
+                "ranks 0 and 1 to GPU 0, rank 2 to GPU 1, rank 3 to GPU 2. "
+                "Must have exactly --tensor-parallel-size entries. "
+                "When unset, ranks are assigned round-robin."
             ),
         )
         parallel_group.add_argument(
@@ -2023,6 +2066,7 @@ class EngineArgs:
             pipeline_parallel_size=self.pipeline_parallel_size,
             tensor_parallel_size=self.tensor_parallel_size,
             tensor_parallel_weights=_parse_tp_weights(self.tensor_parallel_weights),
+            tensor_parallel_rank_gpus=_parse_tp_rank_gpus(self.tensor_parallel_rank_gpus),
             prefill_context_parallel_size=self.prefill_context_parallel_size,
             data_parallel_size=self.data_parallel_size,
             data_parallel_rank=self.data_parallel_rank or 0,

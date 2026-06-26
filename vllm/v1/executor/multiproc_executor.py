@@ -175,6 +175,12 @@ class MultiprocExecutor(Executor):
             cpu_omp_manager = OMPProcessManager(self.vllm_config)
             for local_rank in range(self.local_world_size):
                 global_rank = global_start_rank + local_rank
+                # Determine GPU for this rank based on heterogeneous TP config
+                gpu_index = self.vllm_config.parallel_config.tp_rank_gpu(global_rank)
+                # Set CUDA_VISIBLE_DEVICES so each process only sees its assigned GPU
+                import os
+                original_cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+                os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
                 is_driver_worker = self._is_driver_worker(global_rank)
                 with cpu_omp_manager.configure_omp_envs(
                     rank=global_rank, local_rank=local_rank
@@ -189,6 +195,7 @@ class MultiprocExecutor(Executor):
                         is_driver_worker=is_driver_worker,
                         inherited_fds=inherited_fds,
                     )
+                os.environ["CUDA_VISIBLE_DEVICES"] = original_cuda_visible
                 unready_workers.append(unready_worker_handle)
                 if inherited_fds is not None:
                     inherited_fds.append(unready_worker_handle.death_writer.fileno())

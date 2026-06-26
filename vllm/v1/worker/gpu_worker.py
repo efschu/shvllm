@@ -282,7 +282,12 @@ class Worker(WorkerBase):
                     f"({visible_device_count})."
                 )
 
-            self.device = torch.device(f"cuda:{self.local_rank}")
+            # Determine GPU assignment based on TP rank
+            if self.parallel_config.tensor_parallel_rank_gpus is not None:
+                gpu_index = self.parallel_config.tp_rank_gpu(self.rank)
+            else:
+                gpu_index = self.local_rank
+            self.device = torch.device(f"cuda:{gpu_index}")
             torch.accelerator.set_device_index(self.device)
 
             current_platform.check_if_supports_dtype(self.model_config.dtype)

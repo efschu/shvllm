@@ -130,6 +130,12 @@ class ParallelConfig:
     receives an equal share, matching pre-heterogeneous-TP behaviour.
     Example: ``[2, 1, 1]`` with TP=3 gives rank 0 a 50% share and ranks 1/2
     a 25% share each."""
+    tensor_parallel_rank_gpus: list[int] | None = None
+    """Optional per-rank GPU assignment for heterogeneous tensor parallelism.
+    Must have exactly ``tensor_parallel_size`` entries, each >= 0 and < num_gpus.
+    Example: ``[0, 0, 1, 2]`` with TP=4 assigns ranks 0 and 1 to GPU 0,
+    rank 2 to GPU 1, rank 3 to GPU 2. When unset (default), ranks are
+    assigned round-robin across available GPUs."""
     prefill_context_parallel_size: int = Field(default=1, ge=1)
     """Number of prefill context parallel groups."""
     data_parallel_size: int = Field(default=1, ge=1)
@@ -452,12 +458,24 @@ class ParallelConfig:
                 raise ValueError(
                     f"all tensor_parallel_weights must be > 0, got {weights}"
                 )
+        if self.tensor_parallel_rank_gpus is not None:
+            gpus = self.tensor_parallel_rank_gpus
+            if len(gpus) != self.tensor_parallel_size:
+                raise ValueError(
+                    "tensor_parallel_rank_gpus must have exactly "
+                    f"{self.tensor_parallel_size} entries (one per TP rank), "
+                    f"got {len(gpus)} entries: {gpus}"
+                )
+            if any(g < 0 for g in gpus):
+                raise ValueError(
+                    f"all tensor_parallel_rank_gpus must be >= 0, got {gpus}"
+                )
         if self._api_process_rank >= self._api_process_count:
             raise ValueError(
-                "Invalid value of `_api_process_rank`. "
-                f"Expected to be `-1` or `[0, {self._api_process_count})`, "
-                f"but found: {self._api_process_rank}"
-            )
+                 "Invalid value of `_api_process_rank`. "
+                 f"Expected to be `-1` or `[0, {self._api_process_count})`, "
+                 f"but found: {self._api_process_rank}"
+             )
 
         if self.all2all_backend in ["pplx", "naive"]:
             logger.warning(
@@ -576,6 +594,19 @@ class ParallelConfig:
             for i in order[:leftover]:
                 base_shares[i] += 1
         return base_shares
+
+    def tp_rank_gpu(self, rank: int) -> int:
+        """Return the GPU index for the given TP rank.
+
+        If ``tensor_parallel_rank_gpus`` is set, returns the explicitly
+        configured GPU for that rank. Otherwise, uses round-robin
+        assignment across available GPUs.
+        """
+        if self.tensor_parallel_rank_gpus is not None:
+            return self.tensor_parallel_rank_gpus[rank]
+        # Default: round-robin
+        num_gpus = torch.cuda.device_count()
+        return rank % num_gpus
 
     @property
     def use_ubatching(self) -> bool:

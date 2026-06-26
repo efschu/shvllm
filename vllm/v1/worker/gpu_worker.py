@@ -289,15 +289,18 @@ class Worker(WorkerBase):
                 # CUDA_VISIBLE_DEVICES is set per-process to isolate to one GPU
                 # So within the process, the GPU is always at index 0
                 self.device = torch.device("cuda:0")
+                # local_rank must be 0 since each worker only sees its own GPU
+                local_rank_for_distributed = 0
             else:
                 gpu_index = self.local_rank
                 self.device = torch.device(f"cuda:{gpu_index}")
+                local_rank_for_distributed = self.local_rank
             torch.accelerator.set_device_index(0)
             init_worker_distributed_environment(
                 self.vllm_config,
                 self.rank,
                 self.distributed_init_method,
-                self.local_rank,
+                local_rank_for_distributed,
                 current_platform.dist_backend,
             )
 

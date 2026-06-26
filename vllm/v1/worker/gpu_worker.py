@@ -283,19 +283,16 @@ class Worker(WorkerBase):
                         f"({visible_device_count})."
                     )
             # Assign device based on TP rank
+            # For heterogeneous TP, CUDA_VISIBLE_DEVICES isolates each worker to one GPU,
+            # so we always use device 0 within that isolated context
             if self.parallel_config.tensor_parallel_rank_gpus is not None:
-                gpu_index = self.parallel_config.tp_rank_gpu(self.rank)
+                # CUDA_VISIBLE_DEVICES is set per-process to isolate to one GPU
+                # So within the process, the GPU is always at index 0
+                self.device = torch.device("cuda:0")
             else:
                 gpu_index = self.local_rank
-            self.device = torch.device(f"cuda:{gpu_index}")
-            torch.accelerator.set_device_index(self.device)
-
-            current_platform.check_if_supports_dtype(self.model_config.dtype)
-
-            # Initialize the distributed environment BEFORE taking
-            # memory snapshot
-            # This ensures NCCL buffers are allocated before we measure
-            # available memory
+                self.device = torch.device(f"cuda:{gpu_index}")
+            torch.accelerator.set_device_index(0)
             init_worker_distributed_environment(
                 self.vllm_config,
                 self.rank,

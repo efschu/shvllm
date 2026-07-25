@@ -951,9 +951,19 @@ class GPUModelRunner(
             return
 
         kv_caches = getattr(self, "kv_caches", [])
-        for cache_tensor in kv_caches:
-            if cache_tensor is not None:
-                cache_tensor.zero_()
+        # Hybrid models register mamba/GDN layers as LISTS of state
+        # tensors (see initialize_kv_cache: kv_caches[layer_name] =
+        # state_tensors) while attention layers are plain tensors - the
+        # flat .zero_() crashed on wake-up with quantized KV. Unpack
+        # containers, but zero plain tensors WHOLE (iterating a tensor
+        # would zero dim-0 slices one kernel launch at a time). The
+        # numel() guard skips unallocated placeholders during partial
+        # wake-up (tags=kv_cache).
+        for layer_kv in kv_caches:
+            tensors = layer_kv if isinstance(layer_kv, (list, tuple)) else (layer_kv,)
+            for cache_tensor in tensors:
+                if cache_tensor is not None and cache_tensor.numel() > 0:
+                    cache_tensor.zero_()
 
         k_attr_names = ("_k_scale", "k_scale")
         v_attr_names = ("_v_scale", "v_scale")

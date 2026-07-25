@@ -2355,6 +2355,7 @@ def get_kv_cache_configs(
         # Suggest a vector proportional to measured blocks x current
         # share, which equalizes block counts on the next start.
         all_blocks = [c.num_blocks for c in kv_cache_configs]
+
         if max(all_blocks) > min_num_blocks * 1.15:
             from vllm.distributed.utils import _TOKEN_VECTOR_UNITS  # noqa
             from vllm.distributed.utils import partition_units
@@ -2376,7 +2377,7 @@ def get_kv_cache_configs(
                 token_vector,
                 ",".join(str(s) for s in suggested),
             )
-    for kv_cache_config in kv_cache_configs:
+    for worker_idx, kv_cache_config in enumerate(kv_cache_configs):
         num_blocks_old = kv_cache_config.num_blocks
         kv_cache_config.num_blocks = min_num_blocks
 
@@ -2394,6 +2395,23 @@ def get_kv_cache_configs(
             num_tokens, max_concurrency = get_kv_cache_capacity(
                 vllm_config, kv_cache_config
             )
+
+            if uneven_dcp and worker_idx > 0:
+                # Under uneven DCP the capacity formula evaluates each
+                # worker's LOCAL page mix (its token-vector and mamba
+                # shares), so ranks > 0 report a per-rank view that does
+                # NOT describe the shared pool. The scheduler plans with
+                # worker 0's number (also exported via cache_config
+                # metrics) - demote the rest to debug to avoid three
+                # contradictory "GPU KV cache size" lines at startup.
+                logger.debug(
+                    "Worker %d local KV view: %s tokens (%.2fx of %s)",
+                    worker_idx,
+                    f"{num_tokens:,}",
+                    max_concurrency,
+                    f"{max_model_len:,}",
+                )
+                continue
 
             logger.info_once("GPU KV cache size: %s tokens", f"{num_tokens:,}")
             logger.info_once(

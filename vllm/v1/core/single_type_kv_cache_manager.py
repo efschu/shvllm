@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Sequence
@@ -964,6 +965,10 @@ class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):
 
 
 class MambaManager(SingleTypeKVCacheManager):
+    # Live window of scheduler-aligned mamba checkpoints per request
+    # under uneven CP (older checkpoints fall back to evictable cache).
+    _MAX_LIVE_CHECKPOINTS = int(os.environ.get("VLLM_UNEVEN_CKPT_WINDOW", "2"))
+
     def __init__(
         self, kv_cache_spec: MambaSpec, block_pool: BlockPool, **kwargs
     ) -> None:
@@ -975,6 +980,10 @@ class MambaManager(SingleTypeKVCacheManager):
             # Mapping from request ID to the index of the block
             # allocated in the previous step
             self.last_state_block_idx: dict[str, int] = {}
+            # Uneven CP: per-request FIFO of the retained scheduler-
+            # aligned checkpoint block indices (see
+            # remove_skipped_blocks); bounded to _MAX_LIVE_CHECKPOINTS.
+            self._live_checkpoints: dict[str, list[int]] = {}
             # The set of the requests that have been allocated blocks
             self._allocated_block_reqs: set[str] = set()
 
@@ -1057,12 +1066,17 @@ class MambaManager(SingleTypeKVCacheManager):
                 < cdiv(num_computed_tokens, self.block_size) - 1
                 # Under uneven context parallelism (virtual scheduler
                 # blocks, scheduler_block_size > block_size) keep
-                # scheduler-aligned checkpoint blocks alive until the
-                # request finishes: freed checkpoints only survive as
-                # evictable cache entries, and the virtual-block factor
-                # shrinks the pool ID space so much that a single long
-                # prefill recycles (and evicts) its own checkpoints before
-                # any follow-up request can hit them. In the default path
+                # scheduler-aligned checkpoint blocks alive: freed
+                # checkpoints only survive as evictable cache entries,
+                # and the virtual-block factor shrinks the pool ID space
+                # so much that a single long prefill recycles (and
+                # evicts) its own checkpoints before any follow-up
+                # request can hit them. Only the LAST couple of
+                # checkpoints stay live (the prefix-cache lookup takes
+                # the rightmost aligned hit); older ones are freed again
+                # below - an unbounded retention held ~120 blocks per
+                # 250k-token request and silently halved the pool's
+                # usable concurrency. In the default path
                 # (scheduler_block_size == block_size) every block is
                 # "aligned", so this must not suppress the free.
                 and (
@@ -1077,6 +1091,23 @@ class MambaManager(SingleTypeKVCacheManager):
                 if blocks[last_state_block_idx] != self._null_block:
                     self.block_pool.free_blocks([blocks[last_state_block_idx]])
                     blocks[last_state_block_idx] = self._null_block
+            elif (
+                self.scheduler_block_size != self.block_size
+                and last_state_block_idx is not None
+                and last_state_block_idx
+                < cdiv(num_computed_tokens, self.block_size) - 1
+            ):
+                # Retained an aligned checkpoint: enqueue it and free the
+                # oldest one beyond the live window.
+                ckpts = self._live_checkpoints.setdefault(request_id, [])
+                if not ckpts or ckpts[-1] != last_state_block_idx:
+                    ckpts.append(last_state_block_idx)
+                while len(ckpts) > self._MAX_LIVE_CHECKPOINTS:
+                    old_idx = ckpts.pop(0)
+                    blocks = self.req_to_blocks[request_id]
+                    if blocks[old_idx] != self._null_block:
+                        self.block_pool.free_blocks([blocks[old_idx]])
+                        blocks[old_idx] = self._null_block
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         """
@@ -1231,6 +1262,7 @@ class MambaManager(SingleTypeKVCacheManager):
         if self.mamba_cache_mode == "align":
             self._allocated_block_reqs.discard(request_id)
             self.last_state_block_idx.pop(request_id, None)
+            self._live_checkpoints.pop(request_id, None)
         return super().pop_blocks_for_free(request_id)
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:

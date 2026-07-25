@@ -1094,6 +1094,31 @@ class CompilationConfig:
         if self.cudagraph_capture_sizes:
             assert self.cudagraph_capture_sizes[-1] == self.max_cudagraph_capture_size
 
+    _HTCCL_COLLECTIVE_OPS = [
+        "vllm::all_reduce",
+        "vllm::reduce_scatter",
+        "vllm::all_gather",
+    ]
+
+    def _htccl_adjust_for_piecewise(self) -> None:
+        if self.splitting_ops is None:
+            self.splitting_ops = list(self._attention_ops)
+        for op in self._HTCCL_COLLECTIVE_OPS:
+            if op not in self.splitting_ops:
+                self.splitting_ops.append(op)
+        if self.cudagraph_mode in (
+            CUDAGraphMode.FULL,
+            CUDAGraphMode.FULL_DECODE_ONLY,
+            CUDAGraphMode.FULL_AND_PIECEWISE,
+        ):
+            logger.warning_once(
+                "HTCCL: cudagraph_mode %s cannot capture host-staged "
+                "collectives; using PIECEWISE (collectives run eagerly "
+                "between captured graph segments).",
+                self.cudagraph_mode.name,
+            )
+            self.cudagraph_mode = CUDAGraphMode.PIECEWISE
+
     def set_splitting_ops_for_v1(
         self, all2all_backend: str, data_parallel_size: int = 1
     ):
@@ -1200,6 +1225,23 @@ class CompilationConfig:
                 "deepep_low_latency, nixl_ep, or allgather_reducescatter."
             )
             self.cudagraph_mode = CUDAGraphMode.NONE
+
+        import os
+
+        import vllm.envs as envs
+
+        if envs.VLLM_HTCCL and (
+            os.environ.get("VLLM_HTCCL_TRANSPORT", "device") != "device"
+        ):
+            # CPU-orchestrated HTCCL transports (shm/gloo) synchronize
+            # with the host and can never live INSIDE a captured CUDA
+            # graph: split them out of the piecewise fx graph (like
+            # attention) and downgrade FULL modes to PIECEWISE. The
+            # default "device" transport runs the whole collective as
+            # GPU kernels spinning on mapped flags - fully capturable,
+            # so graphs stay untouched there. Runs LAST so the regular
+            # splitting-op resolution above stays intact.
+            self._htccl_adjust_for_piecewise()
 
     def set_splitting_ops_for_attn_fusion(self):
         assert self.pass_config.fuse_attn_quant

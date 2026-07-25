@@ -227,6 +227,17 @@ if TYPE_CHECKING:
     VLLM_HAS_FLASHINFER_CUBIN: bool = False
     VLLM_ROCM_FP8_MFMA_PAGE_ATTN: bool = False
     VLLM_ALLREDUCE_USE_SYMM_MEM: bool = True
+    VLLM_HTCCL: bool = False
+    VLLM_HTCCL_TRANSPORT: str = "device"
+    VLLM_HTCCL_SLOT_MIB: int = 64
+    VLLM_HTCCL_CHUNK_MIB: int = 8
+    VLLM_HTCCL_PIPE_CHUNK_MIB: int = 4
+    VLLM_HTCCL_FP32_REDUCE: bool = True
+    VLLM_UNEVEN_TOKEN_VECTOR: str | None = None
+    VLLM_UNEVEN_DCP_COMBINE: str | None = None
+    VLLM_GGUF_MMQ_MAX_TOKENS: int = 16
+    VLLM_GGUF_DEQUANT_CHUNK_MIB: int = 192
+    VLLM_GGUF_USE_CUDA: bool = True
     VLLM_ALLREDUCE_USE_FLASHINFER: bool = False
     VLLM_TUNED_CONFIG_FOLDER: str | None = None
     VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS: set[str] = set()
@@ -1678,6 +1689,42 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ALLREDUCE_USE_SYMM_MEM": lambda: bool(
         int(os.getenv("VLLM_ALLREDUCE_USE_SYMM_MEM", "1"))
     ),
+    # HTCCL: route TP collectives over the vendor-neutral host-staged
+    # path (for GPU groups without a common device collective library,
+    # e.g. mixed NVIDIA+AMD; also forceable on homogeneous groups)
+    "VLLM_HTCCL": lambda: bool(int(os.getenv("VLLM_HTCCL", "0"))),
+    # HTCCL data plane: "device" (GPU-driven DMA + spin kernels, CUDA-
+    # graph-capturable), "shm" (CPU-orchestrated pinned staging) or
+    # "gloo" (TCP; also multi-node)
+    "VLLM_HTCCL_TRANSPORT": lambda: os.getenv("VLLM_HTCCL_TRANSPORT", "device"),
+    # Per-rank shm slot size (MiB) for HTCCL payload staging
+    "VLLM_HTCCL_SLOT_MIB": lambda: int(os.getenv("VLLM_HTCCL_SLOT_MIB", "64")),
+    # Chunk size (MiB) of the gloo data-plane pipeline
+    "VLLM_HTCCL_CHUNK_MIB": lambda: int(os.getenv("VLLM_HTCCL_CHUNK_MIB", "8")),
+    # Chunk size (MiB) of the device transport's dual-stream pipeline
+    "VLLM_HTCCL_PIPE_CHUNK_MIB": lambda: int(
+        os.getenv("VLLM_HTCCL_PIPE_CHUNK_MIB", "4")
+    ),
+    # Upcast half dtypes to fp32 for the gloo-plane reduction
+    "VLLM_HTCCL_FP32_REDUCE": lambda: bool(
+        int(os.getenv("VLLM_HTCCL_FP32_REDUCE", "1"))
+    ),
+    # Uneven DCP: measured KV token vector (one int per rank) from the
+    # self-calibration hint logged at startup
+    "VLLM_UNEVEN_TOKEN_VECTOR": lambda: os.getenv("VLLM_UNEVEN_TOKEN_VECTOR"),
+    # Uneven DCP decode combine: "a2a" (fused all-to-all, default) or
+    # "ar" (allgather+reduce fallback)
+    "VLLM_UNEVEN_DCP_COMBINE": lambda: os.getenv("VLLM_UNEVEN_DCP_COMBINE"),
+    # GGUF plugin: max tokens for the MMQ kernel path (above: dequant+GEMM)
+    "VLLM_GGUF_MMQ_MAX_TOKENS": lambda: int(
+        os.getenv("VLLM_GGUF_MMQ_MAX_TOKENS", "16")
+    ),
+    # GGUF plugin: cap (MiB) for one dequantized-weight transient
+    "VLLM_GGUF_DEQUANT_CHUNK_MIB": lambda: int(
+        os.getenv("VLLM_GGUF_DEQUANT_CHUNK_MIB", "192")
+    ),
+    # GGUF plugin: use CUDA kernels (0 = triton fallbacks)
+    "VLLM_GGUF_USE_CUDA": lambda: bool(int(os.getenv("VLLM_GGUF_USE_CUDA", "1"))),
     # Whether to use FlashInfer allreduce
     "VLLM_ALLREDUCE_USE_FLASHINFER": lambda: bool(
         int(os.getenv("VLLM_ALLREDUCE_USE_FLASHINFER", "0"))

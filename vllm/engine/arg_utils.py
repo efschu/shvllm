@@ -2553,6 +2553,11 @@ class EngineArgs:
                 "classic even split."
             )
             self.rank_tp_ratio = None
+            if isinstance(self.rank_gpu_memory_mib, list):
+                # Even split takes a single scalar budget (a per-rank
+                # list requires a ratio); uniform weights imply equal
+                # budgets, so collapsing to min() is lossless.
+                self.rank_gpu_memory_mib = min(self.rank_gpu_memory_mib)
             return
         self.rank_tp_ratio = weights
         if self.decode_context_parallel_size <= 1:

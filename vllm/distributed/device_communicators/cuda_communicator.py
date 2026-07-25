@@ -65,11 +65,28 @@ class CudaCommunicator(DeviceCommunicatorBase):
         from vllm.distributed.device_communicators.flashinfer_all_reduce import (
             FlashInferAllReduce,
         )
+        from vllm.distributed.device_communicators.htccl import (
+            HTCCLCommunicator,
+        )
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
         from vllm.distributed.device_communicators.quick_all_reduce import (
             QuickAllReduce,
         )
         from vllm.distributed.device_communicators.symm_mem import SymmMemCommunicator
+
+        self.htccl_comm: HTCCLCommunicator | None = None
+        if envs.VLLM_HTCCL and self.world_size > 1:
+            self.htccl_comm = HTCCLCommunicator(
+                cpu_group=self.cpu_group,
+                device=self.device,
+            )
+            logger.info_once(
+                "HTCCL enabled for group '%s': collectives run over the "
+                "vendor-neutral host-staged path, outside the CUDA graphs "
+                "(piecewise capture; FULL graph modes are downgraded).",
+                unique_name,
+                scope="global",
+            )
 
         self.pynccl_comm: PyNcclCommunicator | None = None
         if self.world_size > 1:
@@ -252,6 +269,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
 
     def all_reduce(self, input_):
+        if self.htccl_comm is not None:
+            return self.htccl_comm.all_reduce(input_)
         # since currently we perform copy input -> symm_input -> out-of-place AR
         # return symm_output, we don't need to check if input is symmetric
         if self.pynccl_comm is not None and should_nccl_symm_mem_allreduce(
@@ -311,6 +330,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
         return out
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
+        if self.htccl_comm is not None:
+            return self.htccl_comm.reduce_scatter(input_, dim)
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
         assert pynccl_comm is not None
@@ -398,7 +419,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
             torch.distributed.recv(tensor, self.ranks[src], self.device_group)
         return tensor
 
+    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        if self.htccl_comm is not None:
+            return self.htccl_comm.all_gather(input_, dim)
+        return super().all_gather(input_, dim)
+
     def broadcast(self, tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
+        if self.htccl_comm is not None:
+            return self.htccl_comm.broadcast(tensor, src)
+        return self._broadcast_impl(tensor, src)
+
+    def _broadcast_impl(self, tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
         """Broadcast a tensor from source rank to all ranks."""
         if self.world_size == 1:
             return tensor

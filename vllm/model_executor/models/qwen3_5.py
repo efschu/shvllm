@@ -78,6 +78,7 @@ from .interfaces import (
     MultiModalEmbeddings,
     SupportsEagle3,
     SupportsLoRA,
+    SupportsMRoPE,
     SupportsPP,
     _require_is_multimodal,
 )
@@ -443,8 +444,10 @@ class Qwen3_5Model(Qwen3NextModel):
 class Qwen3_5ForCausalLMBase(
     nn.Module,
     HasInnerState,
+    IsHybrid,
     SupportsEagle3,
     SupportsLoRA,
+    SupportsMRoPE,
     SupportsPP,
 ):
     packed_modules_mapping = {
@@ -501,6 +504,25 @@ class Qwen3_5ForCausalLMBase(
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
+    def get_mrope_input_positions(
+        self,
+        input_tokens: list[int],
+        mm_features: list,
+    ) -> tuple[torch.Tensor, int]:
+        # Text-only model: all three M-RoPE position streams (T/H/W) are
+        # identical to the plain 1D positions.
+        if mm_features:
+            raise ValueError(
+                "Qwen3_5ForCausalLM is text-only and cannot compute M-RoPE "
+                "positions for multimodal inputs. Use "
+                "Qwen3_5ForConditionalGeneration instead."
+            )
+        num_tokens = len(input_tokens)
+        positions = (
+            torch.arange(num_tokens, dtype=torch.long).unsqueeze(0).expand(3, -1)
+        )
+        return positions, 0
+
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
         self.model.aux_hidden_state_layers = layers
 
@@ -534,6 +556,67 @@ class Qwen3_5ForCausalLMBase(
             skip_prefixes=["mtp."],
         )
         return loader.load_weights(weights)
+
+    # Same hybrid GDN cache layout as Qwen3_5ForConditionalGeneration.
+    @classmethod
+    def get_mamba_state_dtype_from_config(
+        cls,
+        vllm_config: "VllmConfig",
+    ) -> tuple[torch.dtype, torch.dtype]:
+        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+            vllm_config.model_config.dtype,
+            vllm_config.cache_config.mamba_cache_dtype,
+            vllm_config.cache_config.mamba_ssm_cache_dtype,
+        )
+
+    @classmethod
+    def get_mamba_state_shape_from_config(
+        cls, vllm_config: "VllmConfig"
+    ) -> tuple[tuple[int, int], tuple[int, int]]:
+        parallel_config = vllm_config.parallel_config
+        hf_config = vllm_config.model_config.hf_text_config
+        tp_size = parallel_config.tensor_parallel_size
+        num_k_heads = hf_config.linear_num_key_heads
+        num_v_heads = hf_config.linear_num_value_heads
+        ratios = parallel_config.rank_tp_ratio
+        if ratios:
+            # Uneven TP: rank-aware in worker processes (matches the
+            # rank-aware get_num_kv_heads, so the derived block size
+            # mamba_page / attn_page is identical on every rank - the
+            # ratio factor cancels). Engine-level callers without an
+            # initialized TP group fall back to the smallest ratio,
+            # consistent with the same fallback in get_num_kv_heads.
+            denom = sum(ratios)
+            try:
+                from vllm.distributed.parallel_state import (
+                    get_tensor_model_parallel_rank,
+                )
+
+                rank = get_tensor_model_parallel_rank()
+            except (AssertionError, ValueError):
+                rank = None
+            unit = ratios[rank] if rank is not None else min(ratios)
+            num_k_heads = num_k_heads * unit // denom
+            num_v_heads = num_v_heads * unit // denom
+            tp_size = 1
+        num_spec = (
+            vllm_config.speculative_config.num_speculative_tokens
+            if vllm_config.speculative_config
+            else 0
+        )
+        return MambaStateShapeCalculator.gated_delta_net_state_shape(
+            tp_size,
+            num_k_heads,
+            num_v_heads,
+            hf_config.linear_key_head_dim,
+            hf_config.linear_value_head_dim,
+            hf_config.linear_conv_kernel_dim,
+            num_spec,
+        )
+
+    @classmethod
+    def get_mamba_state_copy_func(cls) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
+        return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
 
 
 class Qwen3_5ForCausalLM(Qwen3_5ForCausalLMBase):
@@ -702,6 +785,29 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         parallel_config = vllm_config.parallel_config
         hf_config = vllm_config.model_config.hf_text_config
         tp_size = parallel_config.tensor_parallel_size
+        num_k_heads = hf_config.linear_num_key_heads
+        num_v_heads = hf_config.linear_num_value_heads
+        ratios = parallel_config.rank_tp_ratio
+        if ratios:
+            # Uneven TP: rank-aware in worker processes (matches the
+            # rank-aware get_num_kv_heads, so the derived block size
+            # mamba_page / attn_page is identical on every rank - the
+            # ratio factor cancels). Engine-level callers without an
+            # initialized TP group fall back to the smallest ratio,
+            # consistent with the same fallback in get_num_kv_heads.
+            denom = sum(ratios)
+            try:
+                from vllm.distributed.parallel_state import (
+                    get_tensor_model_parallel_rank,
+                )
+
+                rank = get_tensor_model_parallel_rank()
+            except (AssertionError, ValueError):
+                rank = None
+            unit = ratios[rank] if rank is not None else min(ratios)
+            num_k_heads = num_k_heads * unit // denom
+            num_v_heads = num_v_heads * unit // denom
+            tp_size = 1
         num_spec = (
             vllm_config.speculative_config.num_speculative_tokens
             if vllm_config.speculative_config
@@ -709,8 +815,8 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         )
         return MambaStateShapeCalculator.gated_delta_net_state_shape(
             tp_size,
-            hf_config.linear_num_key_heads,
-            hf_config.linear_num_value_heads,
+            num_k_heads,
+            num_v_heads,
             hf_config.linear_key_head_dim,
             hf_config.linear_value_head_dim,
             hf_config.linear_conv_kernel_dim,

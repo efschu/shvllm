@@ -5,6 +5,7 @@ from collections.abc import Sequence
 from typing import NamedTuple
 
 from vllm import envs
+from vllm.distributed.utils import cp_token_split_factor, uneven_cp_ratios
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
@@ -79,6 +80,8 @@ class KVCacheCoordinator(ABC):
         self.kv_cache_config = kv_cache_config
         self.max_model_len = max_model_len
         self.enable_caching = enable_caching
+        self.dcp_world_size = dcp_world_size
+        self.pcp_world_size = pcp_world_size
         # The scheduling granularity (LCM of all group block sizes), must be a multiple
         # of the hash_block_size and the block size of each group.
         assert scheduler_block_size % hash_block_size == 0 and all(
@@ -453,10 +456,10 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         self.block_size = self.kv_cache_spec.block_size
         self.dcp_world_size = dcp_world_size
         self.pcp_world_size = pcp_world_size
-        if dcp_world_size > 1:
-            self.block_size *= dcp_world_size
-        if pcp_world_size > 1:
-            self.block_size *= pcp_world_size
+        if dcp_world_size > 1 or pcp_world_size > 1:
+            # Virtual scheduler blocks span cp_token_split_factor physical
+            # blocks (dcp * pcp, or sum(--rank-tp-ratio) under uneven DCP).
+            self.block_size *= cp_token_split_factor(dcp_world_size, pcp_world_size)
         # For models using only Mamba, block_size is set to max_model_len when
         # prefix caching is disabled, and hash_block_size validation is skipped.
         assert not enable_caching or (hash_block_size == self.block_size), (
@@ -544,7 +547,12 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             g.kv_cache_spec.block_size % hash_block_size == 0
             for g in kv_cache_config.kv_cache_groups
         ), "block_size must be divisible by hash_block_size"
-        assert dcp_world_size == 1, "DCP not support hybrid attn now."
+        # Uneven DCP supports hybrid models: attention groups are
+        # token-split (virtual blocks), mamba groups keep full state per
+        # rank. Classic even DCP/PCP remains unsupported for hybrids.
+        assert dcp_world_size == 1 or uneven_cp_ratios(dcp_world_size) is not None, (
+            "DCP not support hybrid attn now."
+        )
         assert pcp_world_size == 1, "PCP not support hybrid attn now."
         self.verify_and_split_kv_cache_groups()
 
@@ -618,6 +626,23 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 retention_interval=self.retention_interval,
             )
 
+    def _group_token_span(self, spec: KVCacheSpec) -> int:
+        """Tokens one allocation block of this group spans for the
+        SCHEDULER: token-split groups use virtual blocks of block_size *
+        cp_token_split_factor under context parallelism (the managers
+        search and cache at this granularity); mamba groups span their
+        raw block_size. Hash-granularity conversions and hit-length math
+        must use this, not the raw block size."""
+        from vllm.v1.kv_cache_interface import MambaSpec
+
+        if self.dcp_world_size * self.pcp_world_size <= 1 or isinstance(
+            spec, MambaSpec
+        ):
+            return spec.block_size
+        return spec.block_size * cp_token_split_factor(
+            self.dcp_world_size, self.pcp_world_size
+        )
+
     def find_longest_cache_hit(
         self,
         block_hashes: list[BlockHash],
@@ -642,11 +667,10 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         """
 
         def _get_block_hashes(kv_cache_spec: KVCacheSpec) -> BlockHashList:
-            if kv_cache_spec.block_size == self.hash_block_size:
+            span = self._group_token_span(kv_cache_spec)
+            if span == self.hash_block_size:
                 return block_hashes
-            return BlockHashListWithBlockSize(
-                block_hashes, self.hash_block_size, kv_cache_spec.block_size
-            )
+            return BlockHashListWithBlockSize(block_hashes, self.hash_block_size, span)
 
         num_groups = len(self.kv_cache_config.kv_cache_groups)
         hit_length = max_cache_hit_length
@@ -675,9 +699,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     # Full attention is downward-closed: we only need to look
                     # up cached blocks once; on subsequent iterations just trim
                     # to the (reduced) current hit length.
-                    curr_hit_length = (
-                        curr_hit_length // spec.block_size * spec.block_size
-                    )
+                    span = self._group_token_span(spec)
+                    curr_hit_length = curr_hit_length // span * span
                     continue
 
                 drop_eagle_block = use_eagle and idx not in eagle_verified
@@ -686,7 +709,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 if drop_eagle_block:
                     # Eagle needs to match one more block and then pop the last.
                     _max_length = min(
-                        curr_hit_length + spec.block_size, max_cache_hit_length
+                        curr_hit_length + self._group_token_span(spec),
+                        max_cache_hit_length,
                     )
                 hit_blocks = manager_cls.find_longest_cache_hit(
                     block_hashes=_get_block_hashes(spec),
@@ -696,8 +720,10 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     kv_cache_spec=spec,
                     drop_eagle_block=drop_eagle_block,
                     alignment_tokens=self.scheduler_block_size,
+                    dcp_world_size=self.dcp_world_size,
+                    pcp_world_size=self.pcp_world_size,
                 )
-                _new_hit_length = len(hit_blocks[0]) * spec.block_size
+                _new_hit_length = len(hit_blocks[0]) * self._group_token_span(spec)
                 if drop_eagle_block:
                     eagle_verified.add(idx)
                 elif _new_hit_length < curr_hit_length:
@@ -718,7 +744,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # Truncate full attention blocks to final hit_length (if present)
         first_group = self.attention_groups[0]
         if isinstance(first_group.spec, FullAttentionSpec):
-            num_blocks = hit_length // first_group.spec.block_size
+            num_blocks = hit_length // self._group_token_span(first_group.spec)
             for group_id in first_group.group_ids:
                 if (blks := hit_blocks_by_group[group_id]) is not None:
                     del blks[num_blocks:]
@@ -742,11 +768,10 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         """
 
         def _get_block_hashes(kv_cache_spec: KVCacheSpec) -> BlockHashList:
-            if kv_cache_spec.block_size == self.hash_block_size:
+            span = self._group_token_span(kv_cache_spec)
+            if span == self.hash_block_size:
                 return block_hashes
-            return BlockHashListWithBlockSize(
-                block_hashes, self.hash_block_size, kv_cache_spec.block_size
-            )
+            return BlockHashListWithBlockSize(block_hashes, self.hash_block_size, span)
 
         num_groups = len(self.kv_cache_config.kv_cache_groups)
         hit_blocks: list[list[KVCacheBlock]] = [[] for _ in range(num_groups)]
@@ -761,8 +786,10 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 kv_cache_spec=spec,
                 drop_eagle_block=use_eagle,
                 alignment_tokens=self.scheduler_block_size,
+                dcp_world_size=self.dcp_world_size,
+                pcp_world_size=self.pcp_world_size,
             )
-            group_hit = len(blocks[0]) * spec.block_size
+            group_hit = len(blocks[0]) * self._group_token_span(spec)
             for gid, blks in zip(group_ids, blocks):
                 hit_blocks[gid] = blks
                 hit_lengths[gid] = group_hit

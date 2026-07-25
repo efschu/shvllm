@@ -198,7 +198,7 @@ from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker import mamba_utils
 from vllm.v1.worker.cp_utils import (
     check_attention_cp_compatibility,
-    get_total_cp_world_size,
+    get_cp_token_split_factor,
 )
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
@@ -7015,14 +7015,20 @@ class GPUModelRunner(
         """
         block_sizes = []
         max_num_blocks = []
+        cp_split_per_group = []
         max_model_len = max(self.max_model_len, self.max_encoder_len)
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             if isinstance(kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec):
                 continue
             block_size = kv_cache_group.kv_cache_spec.block_size
             block_sizes.append(block_size)
+            # Mamba/linear-attention groups keep their full per-sequence
+            # state on every rank - no token-axis split under CP.
+            cp_split = not isinstance(kv_cache_group.kv_cache_spec, MambaSpec)
+            cp_split_per_group.append(cp_split)
             max_num_blocks_per_req = cdiv(
-                max_model_len, block_size * get_total_cp_world_size()
+                max_model_len,
+                block_size * (get_cp_token_split_factor() if cp_split else 1),
             )
             if isinstance(kv_cache_group.kv_cache_spec, MambaSpec):
                 max_num_blocks_per_req = (
@@ -7047,6 +7053,7 @@ class GPUModelRunner(
                 block_sizes=block_sizes,
                 kernel_block_sizes=kernel_block_sizes,
                 max_num_blocks_per_req=max_num_blocks,
+                cp_split_per_group=cp_split_per_group,
                 num_spec_tokens=self.num_spec_tokens,
                 logitsprocs=self.input_batch.logitsprocs,
                 logitsprocs_need_output_token_ids=self.input_batch.logitsprocs_need_output_token_ids,

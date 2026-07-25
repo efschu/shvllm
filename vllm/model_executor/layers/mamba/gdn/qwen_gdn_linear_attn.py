@@ -450,11 +450,30 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # Per-rank (local) shard sizes. Even TP: total // tp_size (with
         # divisibility assert, exactly the previous behavior). Uneven TP
         # (--rank-tp-ratio): this rank's ratio share.
+        # Quant-aware family units: shard cuts of the out_proj INPUT
+        # (value dim) must land on quant-block boundaries - e.g. GGUF
+        # K-quant superblocks (256) force units of 2 k-heads (2*384 =
+        # 3*256), i.e. 8 units instead of 16.
+        import math as _math
+
+        _unit_v_elems = self.head_v_dim * (self.num_v_heads // self.num_k_heads)
+        _group = getattr(self.quant_config, "group_size", None) or 1
+        if _group > 1 and _unit_v_elems % _group:
+            _k_per_unit = _math.lcm(_unit_v_elems, _group) // _unit_v_elems
+            if self.num_k_heads % _k_per_unit:
+                raise ValueError(
+                    f"GDN k heads ({self.num_k_heads}) cannot be "
+                    f"partitioned in steps of {_k_per_unit} (quant group "
+                    f"{_group} vs {_unit_v_elems} value elems per head)."
+                )
+            self.tp_family_units = self.num_k_heads // _k_per_unit
+        else:
+            self.tp_family_units = self.num_k_heads
         self.local_num_k_heads = tp_partition_size(
-            self.num_k_heads, self.tp_size, self.tp_rank
+            self.num_k_heads, self.tp_size, self.tp_rank, self.tp_family_units
         )
         self.local_num_v_heads = tp_partition_size(
-            self.num_v_heads, self.tp_size, self.tp_rank
+            self.num_v_heads, self.tp_size, self.tp_rank, self.tp_family_units
         )
         self.local_key_dim = self.head_k_dim * self.local_num_k_heads
         self.local_value_dim = self.head_v_dim * self.local_num_v_heads
@@ -480,6 +499,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             output_size=self.conv_dim,
             bias=False,
             prefix=f"{prefix}.conv1d",
+            tp_units=self.tp_family_units,
         )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
 
@@ -518,6 +538,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             ],
             self.tp_size,
             self.tp_rank,
+            tp_units=self.tp_family_units,
         )
 
         # selective projection used to make dt, B and C input dependent
@@ -534,8 +555,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
         )
 
-        set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(0)})
-        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
+        set_weight_attrs(
+            self.A_log,
+            {"weight_loader": sharded_weight_loader(0, self.tp_family_units)},
+        )
+        set_weight_attrs(
+            self.dt_bias,
+            {"weight_loader": sharded_weight_loader(0, self.tp_family_units)},
+        )
 
         output_gate_type = getattr(config, "output_gate_type", "silu")
         if output_gate_type == "swish":
@@ -560,6 +587,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             input_is_parallel=True,
             quant_config=self.quant_config,
             prefix=f"{prefix}.out_proj",
+            tp_units=self.tp_family_units,
         )
 
         self.chunk_gated_delta_rule = ChunkGatedDeltaRule()
@@ -598,6 +626,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             bias=False,
             quant_config=quant_config,
             prefix=prefix,
+            tp_units=self.tp_family_units,
         )
 
     def create_ba_proj(
@@ -622,6 +651,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             quant_config=quant_config,
             prefix=prefix,
             disable_tp=self.maybe_disable_tp(quant_config),
+            tp_units=self.tp_family_units,
         )
 
     def maybe_disable_tp(self, quant_config: QuantizationConfig | None) -> bool:
@@ -647,7 +677,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if self.disable_tp_for_ba_proj and self.tp_size > 1:
             # ba_proj is replicated for Marlin; slice b/a to local TP rank.
             ba_chunk = self.local_num_v_heads
-            ba_start = tp_partition_offset(self.num_v_heads, self.tp_size, self.tp_rank)
+            ba_start = tp_partition_offset(
+                self.num_v_heads, self.tp_size, self.tp_rank, self.tp_family_units
+            )
             b = b[:, ba_start : ba_start + ba_chunk]
             a = a[:, ba_start : ba_start + ba_chunk]
         return b, a

@@ -354,6 +354,30 @@ class Scheduler(SchedulerInterface):
             # Additionally, when Eagle mode is enabled, FullAttn prunes the last
             # matching block. To prevent this from causing a Mamba cache miss, the
             # last chunk must be not smaller than `block_size`.
+            if self.block_size != self.cache_config.block_size:
+                # Uneven context parallelism: the prefix cache operates on
+                # virtual scheduler blocks (cache block_size x token-vector
+                # sum), so mamba states are only hittable when a prefill
+                # step ends exactly on a scheduler-block boundary. The
+                # token budget may be smaller than one scheduler block, so
+                # instead of rounding the chunk down (which could yield 0
+                # and starve the request), clip the step at the next
+                # boundary it would cross; steps between boundaries run
+                # unaligned and a later step lands the checkpoint.
+                block_size = self.block_size
+                last_cache_position = num_tokens_total = request.num_tokens
+                last_cache_position = num_tokens_total - num_tokens_total % block_size
+                if self.use_eagle:
+                    last_cache_position = max(last_cache_position - block_size, 0)
+                after = num_computed_tokens + num_new_tokens
+                if after < last_cache_position:
+                    boundary = after // block_size * block_size
+                    if boundary > num_computed_tokens:
+                        num_new_tokens = boundary - num_computed_tokens
+                elif num_computed_tokens < last_cache_position < after:
+                    # force the step to end on the last cacheable boundary
+                    num_new_tokens = last_cache_position - num_computed_tokens
+                return num_new_tokens
             block_size = self.cache_config.block_size
             last_cache_position = request.num_tokens - request.num_tokens % block_size
             # eagle prune

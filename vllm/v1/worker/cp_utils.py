@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.distributed import get_dcp_group, get_pcp_group
+from vllm.distributed.utils import cp_token_split_factor
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -56,3 +57,20 @@ def get_total_cp_world_size():
         # DCP might not be initialized in testing
         dcp_world_size = 1
     return dcp_world_size * pcp_world_size
+
+
+def get_cp_token_split_factor() -> int:
+    """Number of block_size units one virtual scheduler block spans.
+
+    Equals get_total_cp_world_size() for the classic even split and
+    sum(--rank-tp-ratio) under uneven DCP.
+    """
+    try:
+        pcp_world_size = get_pcp_group().world_size
+    except AssertionError:
+        pcp_world_size = 1
+    try:
+        dcp_world_size = get_dcp_group().world_size
+    except AssertionError:
+        dcp_world_size = 1
+    return cp_token_split_factor(dcp_world_size, pcp_world_size)

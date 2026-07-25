@@ -85,6 +85,7 @@ class Qwen2MoeMLP(nn.Module):
         expert_gate: torch.nn.Linear | None = None,
         is_sequence_parallel: bool = False,
         prefix: str = "",
+        tp_units: int | None = None,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -94,6 +95,7 @@ class Qwen2MoeMLP(nn.Module):
             quant_config=quant_config,
             disable_tp=is_sequence_parallel,
             prefix=f"{prefix}.gate_up_proj",
+            tp_units=tp_units,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -103,6 +105,7 @@ class Qwen2MoeMLP(nn.Module):
             reduce_results=reduce_results,
             disable_tp=is_sequence_parallel,
             prefix=f"{prefix}.down_proj",
+            tp_units=tp_units,
         )
         if hidden_act != "silu":
             raise ValueError(

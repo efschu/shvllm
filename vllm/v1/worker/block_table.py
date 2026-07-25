@@ -5,12 +5,13 @@ import numpy as np
 import torch
 
 from vllm.distributed import get_dcp_group, get_pcp_group
+from vllm.distributed.utils import cp_rank_ratio_prefix
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.utils import CpuGpuBuffer
-from vllm.v1.worker.cp_utils import get_total_cp_world_size
+from vllm.v1.worker.cp_utils import get_cp_token_split_factor
 
 logger = init_logger(__name__)
 
@@ -26,6 +27,7 @@ class BlockTable:
         device: torch.device,
         kernel_block_size: int,
         cp_kv_cache_interleave_size: int,
+        cp_split: bool = True,
     ):
         """
         Args:
@@ -38,11 +40,52 @@ class BlockTable:
             kernel_block_size: The block_size of underlying attention kernel.
                 Will be the same as `block_size` if `block_size` is supported
                 by the attention kernel.
+            cp_split: Whether this KV cache group is split along the token
+                axis under context parallelism. Mamba/linear-attention
+                groups keep their full per-sequence state on every rank
+                and must pass False.
         """
         self.max_num_reqs = max_num_reqs
         self.max_num_batched_tokens = max_num_batched_tokens
         self.pin_memory = pin_memory
         self.device = device
+
+        try:
+            self.pcp_world_size = get_pcp_group().world_size
+            self.pcp_rank = get_pcp_group().rank_in_group
+        except AssertionError:
+            # PCP might not be initialized in testing
+            self.pcp_world_size = 1
+            self.pcp_rank = 0
+        try:
+            self.dcp_world_size = get_dcp_group().world_size
+            self.dcp_rank = get_dcp_group().rank_in_group
+        except AssertionError:
+            # DCP might not be initialized in testing
+            self.dcp_world_size = 1
+            self.dcp_rank = 0
+        self.cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
+
+        # Token-axis split parameters of this rank: within every round of
+        # (split_factor * interleave) tokens, this rank owns the segment
+        # [prefix * interleave, (prefix + ratio) * interleave). The even
+        # split is the special case (ratio=1, prefix=cp_rank,
+        # split_factor=cp_world_size); uneven DCP takes the values from
+        # --rank-tp-ratio.
+        if not cp_split:
+            self.cp_rank_ratio, self.cp_rank_prefix, self.cp_split_factor = 1, 0, 1
+        elif self.pcp_world_size > 1:
+            # PCP is never combined with uneven ratios (validated at config
+            # time); classic even split over the total CP grid.
+            self.cp_rank_ratio = 1
+            self.cp_rank_prefix = self.pcp_rank * self.dcp_world_size + self.dcp_rank
+            self.cp_split_factor = self.pcp_world_size * self.dcp_world_size
+        else:
+            (
+                self.cp_rank_ratio,
+                self.cp_rank_prefix,
+                self.cp_split_factor,
+            ) = cp_rank_ratio_prefix(self.dcp_world_size, self.dcp_rank)
 
         if kernel_block_size == block_size:
             # Standard case: allocation and computation use same block size
@@ -65,6 +108,17 @@ class BlockTable:
             self.blocks_per_kv_block = block_size // kernel_block_size
             self.use_hybrid_blocks = True
 
+        if self.cp_rank_ratio > 1:
+            # Uneven DCP: the scheduler allocates "virtual" blocks spanning
+            # block_size * cp_split_factor tokens; this rank owns a
+            # contiguous superblock of cp_rank_ratio physical blocks per
+            # virtual block. Reuse the kernel-block expansion to map each
+            # scheduler block ID to its cp_rank_ratio physical block IDs,
+            # so attention backends see a dense, ordinary per-rank block
+            # table of the locally stored tokens.
+            self.blocks_per_kv_block *= self.cp_rank_ratio
+            self.use_hybrid_blocks = True
+
         self.max_num_blocks_per_req = max_num_blocks_per_req * self.blocks_per_kv_block
 
         self.block_table = self._make_buffer(
@@ -82,22 +136,6 @@ class BlockTable:
             )
         else:
             self._kernel_block_arange = None
-
-        try:
-            self.pcp_world_size = get_pcp_group().world_size
-            self.pcp_rank = get_pcp_group().rank_in_group
-        except AssertionError:
-            # PCP might not be initialized in testing
-            self.pcp_world_size = 1
-            self.pcp_rank = 0
-        try:
-            self.dcp_world_size = get_dcp_group().world_size
-            self.dcp_rank = get_dcp_group().rank_in_group
-        except AssertionError:
-            # DCP might not be initialized in testing
-            self.dcp_world_size = 1
-            self.dcp_rank = 0
-        self.cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
 
     def append_row(
         self,
@@ -145,8 +183,6 @@ class BlockTable:
         positions: torch.Tensor,
     ) -> None:
         num_tokens = positions.shape[0]
-        total_cp_world_size = self.pcp_world_size * self.dcp_world_size
-        total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
         _compute_slot_mapping_kernel[(num_reqs + 1,)](
             num_tokens,
             self.max_num_batched_tokens,
@@ -156,8 +192,9 @@ class BlockTable:
             self.block_table.gpu.stride(0),
             self.block_size,
             self.slot_mapping.gpu,
-            TOTAL_CP_WORLD_SIZE=total_cp_world_size,
-            TOTAL_CP_RANK=total_cp_rank,
+            CP_RANK_RATIO=self.cp_rank_ratio,
+            CP_RANK_PREFIX=self.cp_rank_prefix,
+            CP_SPLIT_FACTOR=self.cp_split_factor,
             CP_KV_CACHE_INTERLEAVE_SIZE=self.cp_kv_cache_interleave_size,
             PAD_ID=PAD_SLOT_ID,
             BLOCK_SIZE=1024,
@@ -234,21 +271,26 @@ class MultiGroupBlockTable:
         kernel_block_sizes: list[int],
         max_num_blocks: list[int] | None = None,
         cp_kv_cache_interleave_size: int = 1,
+        cp_split_per_group: list[bool] | None = None,
     ) -> None:
         if len(kernel_block_sizes) != len(block_sizes):
             raise ValueError(
                 f"kernel_block_sizes length ({len(kernel_block_sizes)}) "
                 f"must match block_sizes length ({len(block_sizes)})"
             )
+        if cp_split_per_group is None:
+            cp_split_per_group = [True] * len(block_sizes)
         if max_num_blocks is None:
             # Note(hc): each dcp rank only store
             # (max_model_len//dcp_world_size) tokens in kvcache,
             # so the block_size which used for calc max_num_blocks_per_req
-            # must be multiplied by dcp_world_size.
-            total_cp_world_size = get_total_cp_world_size()
+            # must be multiplied by dcp_world_size (sum(ratios) under
+            # uneven DCP). Groups that are not token-split (mamba) keep
+            # the full budget.
+            split_factor = get_cp_token_split_factor()
             max_num_blocks = [
-                cdiv(max_model_len, block_size * total_cp_world_size)
-                for block_size in block_sizes
+                cdiv(max_model_len, block_size * (split_factor if split else 1))
+                for block_size, split in zip(block_sizes, cp_split_per_group)
             ]
 
         if len(max_num_blocks) != len(block_sizes):
@@ -274,9 +316,10 @@ class MultiGroupBlockTable:
                 device,
                 kernel_block_size,
                 cp_kv_cache_interleave_size,
+                cp_split,
             )
-            for block_size, kernel_block_size, max_num_blocks_per_req in zip(
-                block_sizes, kernel_block_sizes, max_num_blocks
+            for block_size, kernel_block_size, max_num_blocks_per_req, cp_split in zip(
+                block_sizes, kernel_block_sizes, max_num_blocks, cp_split_per_group
             )
         ]
 
@@ -332,12 +375,22 @@ def _compute_slot_mapping_kernel(
     block_table_stride,  # max_num_blocks_per_req
     block_size,
     slot_mapping_ptr,  # [max_num_tokens], int64
-    TOTAL_CP_WORLD_SIZE: tl.constexpr,
-    TOTAL_CP_RANK: tl.constexpr,
+    CP_RANK_RATIO: tl.constexpr,
+    CP_RANK_PREFIX: tl.constexpr,
+    CP_SPLIT_FACTOR: tl.constexpr,
     CP_KV_CACHE_INTERLEAVE_SIZE: tl.constexpr,
     PAD_ID: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
+    # Token-axis ownership: within every round of
+    # CP_SPLIT_FACTOR * interleave tokens, this rank owns the segment
+    # [CP_RANK_PREFIX * interleave, (CP_RANK_PREFIX + CP_RANK_RATIO) *
+    # interleave). Even CP is the special case (ratio=1, prefix=cp_rank,
+    # split=cp_world_size) - the formulas below then reduce exactly to
+    # the classic round-robin mapping. Under uneven DCP the rank owns
+    # CP_RANK_RATIO physical blocks per virtual block, exposed as
+    # consecutive block-table columns via the blocks_per_kv_block
+    # expansion in BlockTable.
     req_idx = tl.program_id(0)
 
     if req_idx == tl.num_programs(0) - 1:
@@ -354,27 +407,41 @@ def _compute_slot_mapping_kernel(
     start_idx = tl.load(query_start_loc_ptr + req_idx).to(tl.int64)
     end_idx = tl.load(query_start_loc_ptr + req_idx + 1).to(tl.int64)
 
-    virtual_block_size = block_size * TOTAL_CP_WORLD_SIZE
+    virtual_block_size = block_size * CP_SPLIT_FACTOR
     row_offset = req_idx * block_table_stride
     for i in range(start_idx, end_idx, BLOCK_SIZE):
         offsets = i + tl.arange(0, BLOCK_SIZE)
         mask = offsets < end_idx
         pos = tl.load(positions_ptr + offsets, mask=mask, other=0)
         block_indices = pos // virtual_block_size
-        block_numbers = tl.load(block_table_ptr + row_offset + block_indices).to(
+
+        virtual_block_offsets = pos - block_indices * virtual_block_size
+        segment = (
+            virtual_block_offsets // CP_KV_CACHE_INTERLEAVE_SIZE
+        ) % CP_SPLIT_FACTOR
+        is_local = (segment >= CP_RANK_PREFIX) & (
+            segment < CP_RANK_PREFIX + CP_RANK_RATIO
+        )
+        # Local offset within this rank's CP_RANK_RATIO * block_size tokens
+        # of the virtual block (only meaningful where is_local).
+        local_block_offsets = (
+            (virtual_block_offsets // (CP_SPLIT_FACTOR * CP_KV_CACHE_INTERLEAVE_SIZE))
+            * (CP_RANK_RATIO * CP_KV_CACHE_INTERLEAVE_SIZE)
+            + (segment - CP_RANK_PREFIX) * CP_KV_CACHE_INTERLEAVE_SIZE
+            + (virtual_block_offsets % CP_KV_CACHE_INTERLEAVE_SIZE)
+        )
+
+        # Non-local tokens can yield negative offsets (segment < prefix);
+        # zero them before the table load so the address stays in bounds
+        # (the loaded value is discarded via is_local below).
+        local_block_offsets = tl.where(is_local, local_block_offsets, 0)
+        table_columns = (
+            block_indices * CP_RANK_RATIO + local_block_offsets // block_size
+        )
+        block_numbers = tl.load(block_table_ptr + row_offset + table_columns).to(
             tl.int64
         )
 
-        virtual_block_offsets = pos - block_indices * virtual_block_size
-        is_local = (
-            virtual_block_offsets // CP_KV_CACHE_INTERLEAVE_SIZE
-        ) % TOTAL_CP_WORLD_SIZE == TOTAL_CP_RANK
-        local_block_offsets = (
-            virtual_block_offsets // (TOTAL_CP_WORLD_SIZE * CP_KV_CACHE_INTERLEAVE_SIZE)
-        ) * CP_KV_CACHE_INTERLEAVE_SIZE + (
-            virtual_block_offsets % CP_KV_CACHE_INTERLEAVE_SIZE
-        )
-
-        slot_ids = block_numbers * block_size + local_block_offsets
+        slot_ids = block_numbers * block_size + local_block_offsets % block_size
         slot_ids = tl.where(is_local, slot_ids, PAD_ID)
         tl.store(slot_mapping_ptr + offsets, slot_ids, mask=mask)
